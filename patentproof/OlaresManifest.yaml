@@ -7,17 +7,17 @@ workloadReplicas:
 
 metadata:
   name: patentproof
-  title: 明細書AI校正
-  description: 特許明細書（docx）をルールとローカルLLMで校正し、変更履歴・コメント付きで保存します
+  title: Patent Proofreader
+  description: Proofread Japanese patent specifications (.docx) with rules and a local LLM, saving results as tracked changes and comments
   icon: https://raw.githubusercontent.com/ryosk7/olares-patentproof/main/icon.png
-  version: 1.0.2
+  version: 1.0.3
   categories:
   - Utilities_v112
 
 entrances:
 - name: patentproof
   port: 8080
-  title: 明細書AI校正
+  title: Patent Proofreader
   host: patentproof
   icon: https://raw.githubusercontent.com/ryosk7/olares-patentproof/main/icon.png
   authLevel: private
@@ -35,29 +35,31 @@ envs:
   editable: true
   applyOnChange: true
   default: "http://3a77b15d.shared.olares.com/v1"
-  description: "LLM の OpenAI 互換 API の URL（Olares Router の共有エントランス）。アプリ内の「設定」画面でも変更できます"
+  description: "OpenAI-compatible API URL of the LLM (e.g. the Olares Router shared entrance). Can also be changed on the app's Settings page."
 - envName: PROOF_LLM_MODEL
   type: string
   required: false
   editable: true
   applyOnChange: true
   default: "Olares/unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_XL"
-  description: "使うモデル名。アプリ内の「設定」画面で一覧から選べます"
+  description: "Model name to use. Can also be picked from a list on the app's Settings page."
 - envName: PROOF_OCR_URL
   type: string
   required: false
   editable: true
   applyOnChange: true
   default: "http://43279715.shared.olares.com"
-  description: "図面OCR（PaddleOCR）の共有エントランス URL。空欄なら図面照合を行いません"
+  description: "Shared entrance URL of PaddleOCR for drawing checks. Leave empty to skip drawing checks."
 
 spec:
-  versionName: '1.0.2'
+  versionName: '1.0.3'
   fullDescription: |
-    Home/Documents 内の特許明細書（.docx）を、校正マニュアルの観点ごとのローカルLLMチェック（3回の多数決）と
-    符号・表記ゆれのルール、図面PDFのOCR照合で校正し、同じフォルダに変更履歴・コメント付きの docx と CSV を保存します。
-    必要なもの: Olares Router 経由で使える LLM（例: Qwen3.8-27B）。図面照合を使う場合は PaddleOCR。
-    初回はアプリの「設定・接続確認」で LLM とモデルを選んでください。
+    Proofreads Japanese patent specifications (.docx) in Home/Documents. A local LLM checks each category
+    (typos and mis-conversions, inconsistent terms, notation variants, colloquial wording, reference-numeral mismatches)
+    with 3-run majority voting, alongside rule-based checks and optional OCR matching against drawing PDFs.
+    Results are saved next to the original as a .docx with tracked changes and comments, plus a CSV list.
+    Requires an LLM reachable through Olares Router (e.g. Qwen3.8-27B); PaddleOCR is optional for drawing checks.
+    On first launch, open "Settings" in the app to choose the LLM and model.
   developer: ryosk7
   submitter: ryosk7
   locale:
