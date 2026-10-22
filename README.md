@@ -1,5 +1,7 @@
 # 明細書AI校正（patentproof）for Olares
 
+<img src="icon.png" width="96" alt="">
+
 特許明細書（.docx）を、Olares 上のローカル LLM で事務校正するアプリです。
 明細書は Olares の外に送信しません。
 

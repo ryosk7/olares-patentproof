@@ -9,8 +9,8 @@ metadata:
   name: patentproof
   title: 明細書AI校正
   description: 特許明細書（docx）をルールとローカルLLMで校正し、変更履歴・コメント付きで保存します
-  icon: https://app.cdn.olares.com/appstore/default/defaulticon.webp
-  version: 1.0.1
+  icon: https://raw.githubusercontent.com/ryosk7/olares-patentproof/main/icon.png
+  version: 1.0.2
   categories:
   - Utilities_v112
 
@@ -19,7 +19,7 @@ entrances:
   port: 8080
   title: 明細書AI校正
   host: patentproof
-  icon: https://app.cdn.olares.com/appstore/default/defaulticon.webp
+  icon: https://raw.githubusercontent.com/ryosk7/olares-patentproof/main/icon.png
   authLevel: private
   openMethod: default
 
@@ -52,7 +52,7 @@ envs:
   description: "図面OCR（PaddleOCR）の共有エントランス URL。空欄なら図面照合を行いません"
 
 spec:
-  versionName: '1.0.1'
+  versionName: '1.0.2'
   fullDescription: |
     Home/Documents 内の特許明細書（.docx）を、校正マニュアルの観点ごとのローカルLLMチェック（3回の多数決）と
     符号・表記ゆれのルール、図面PDFのOCR照合で校正し、同じフォルダに変更履歴・コメント付きの docx と CSV を保存します。
