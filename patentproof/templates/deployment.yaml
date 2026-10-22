@@ -1,0 +1,107 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: patentproof
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: patentproof
+spec:
+  replicas: {{ .Values.workloads.patentproof.replicaCount }}
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: patentproof
+  template:
+    metadata:
+      labels:
+        app: patentproof
+      annotations:
+        checksum/code: {{ (.Files.Glob "app/*.py").AsConfig | sha256sum }}
+    spec:
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+      - name: patentproof
+        image: python:3.12-slim
+        command:
+        - sh
+        - -c
+        - |
+          set -e
+          pip install --no-cache-dir --disable-pip-version-check --target /tmp/pylib python-docx==1.2.0 pypdf
+          exec python -u /app/server.py
+        env:
+        - name: PYTHONPATH
+          value: /tmp/pylib
+        - name: HOME
+          value: /tmp
+        - name: DOCS_ROOT
+          value: /data/Documents
+        - name: PORT
+          value: "8080"
+        - name: PROOF_LLM_BASE_URL
+          value: {{ .Values.olaresEnv.PROOF_LLM_BASE_URL | default .Values.llm.baseUrl | quote }}
+        - name: PROOF_LLM_MODEL
+          value: {{ .Values.olaresEnv.PROOF_LLM_MODEL | default .Values.llm.model | quote }}
+        - name: PROOF_OCR_URL
+          value: {{ .Values.olaresEnv.PROOF_OCR_URL | default "" | quote }}
+        - name: APP_DATA
+          value: /appdata
+        - name: PROOF_LLM_REASONING
+          value: {{ .Values.llm.reasoning | quote }}
+        ports:
+        - containerPort: 8080
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 1000m
+            memory: 1Gi
+        volumeMounts:
+        - name: code
+          mountPath: /app
+        - name: tmp
+          mountPath: /tmp
+        - name: userdata
+          mountPath: /data
+        - name: appdata
+          mountPath: /appdata
+      volumes:
+      - name: code
+        configMap:
+          name: patentproof-code
+      - name: tmp
+        emptyDir: {}
+      - name: userdata
+        hostPath:
+          type: Directory
+          path: {{ .Values.userspace.userData }}
+      - name: appdata
+        hostPath:
+          type: DirectoryOrCreate
+          path: {{ .Values.userspace.appData }}/patentproof
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: patentproof
+  namespace: {{ .Release.Namespace }}
+spec:
+  selector:
+    app: patentproof
+  type: ClusterIP
+  ports:
+  - protocol: TCP
+    name: http
+    port: 8080
+    targetPort: 8080

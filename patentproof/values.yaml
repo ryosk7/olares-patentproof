@@ -1,0 +1,8 @@
+llm:
+  baseUrl: "http://3a77b15d.shared.olares.com/v1"
+  model: "Olares/unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_XL"
+  reasoning: "low"
+workloads:
+  patentproof:
+    replicaCount: 1
+olaresEnv: {}

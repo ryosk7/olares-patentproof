@@ -1,0 +1,6 @@
+apiVersion: v2
+name: patentproof
+description: 特許明細書の事務校正（ルール + ローカルLLM）
+type: application
+version: '1.0.1'
+appVersion: "1.0.0"

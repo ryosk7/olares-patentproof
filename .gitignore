@@ -1,0 +1,9 @@
+*.tgz
+__pycache__/
+*.pyc
+.DS_Store
+*.docx
+*.pdf
+*_OCR.txt
+*_修正箇所一覧.csv
+.patentproof/

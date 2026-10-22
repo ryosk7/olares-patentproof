@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: patentproof-code
+  namespace: {{ .Release.Namespace }}
+data:
+{{ (.Files.Glob "app/*.py").AsConfig | indent 2 }}

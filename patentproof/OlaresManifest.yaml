@@ -1,0 +1,82 @@
+olaresManifest.version: '0.12.0'
+olaresManifest.type: app
+apiVersion: 'v3'
+
+workloadReplicas:
+  patentproof: 1
+
+metadata:
+  name: patentproof
+  title: 明細書AI校正
+  description: 特許明細書（docx）をルールとローカルLLMで校正し、変更履歴・コメント付きで保存します
+  icon: https://app.cdn.olares.com/appstore/default/defaulticon.webp
+  version: 1.0.1
+  categories:
+  - Utilities_v112
+
+entrances:
+- name: patentproof
+  port: 8080
+  title: 明細書AI校正
+  host: patentproof
+  icon: https://app.cdn.olares.com/appstore/default/defaulticon.webp
+  authLevel: private
+  openMethod: default
+
+permission:
+  appData: true
+  userData:
+  - Home/Documents/
+
+envs:
+- envName: PROOF_LLM_BASE_URL
+  type: url
+  required: false
+  editable: true
+  applyOnChange: true
+  default: "http://3a77b15d.shared.olares.com/v1"
+  description: "LLM の OpenAI 互換 API の URL（Olares Router の共有エントランス）。アプリ内の「設定」画面でも変更できます"
+- envName: PROOF_LLM_MODEL
+  type: string
+  required: false
+  editable: true
+  applyOnChange: true
+  default: "Olares/unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_XL"
+  description: "使うモデル名。アプリ内の「設定」画面で一覧から選べます"
+- envName: PROOF_OCR_URL
+  type: string
+  required: false
+  editable: true
+  applyOnChange: true
+  default: "http://43279715.shared.olares.com"
+  description: "図面OCR（PaddleOCR）の共有エントランス URL。空欄なら図面照合を行いません"
+
+spec:
+  versionName: '1.0.1'
+  fullDescription: |
+    Home/Documents 内の特許明細書（.docx）を、校正マニュアルの観点ごとのローカルLLMチェック（3回の多数決）と
+    符号・表記ゆれのルール、図面PDFのOCR照合で校正し、同じフォルダに変更履歴・コメント付きの docx と CSV を保存します。
+    必要なもの: Olares Router 経由で使える LLM（例: Qwen3.8-27B）。図面照合を使う場合は PaddleOCR。
+    初回はアプリの「設定・接続確認」で LLM とモデルを選んでください。
+  developer: ryosk7
+  submitter: ryosk7
+  locale:
+  - ja-JP
+  - en-US
+  supportArch:
+  - amd64
+  - arm64
+  accelerator:
+  - mode: cpu
+    requiredCpu: 100m
+    limitedCpu: 1000m
+    requiredMemory: 128Mi
+    limitedMemory: 1Gi
+    requiredDisk: 50Mi
+    limitedDisk: 1Gi
+
+options:
+  dependencies:
+  - name: olares
+    type: system
+    version: '>=1.12.6-0'
