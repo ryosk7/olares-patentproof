@@ -6,7 +6,7 @@
 - `patentproof/` — Olares アプリのチャート（`OlaresManifest.yaml`, `Chart.yaml`, `values.yaml`, `templates/`）
 - `patentproof/app/proofread.py` — 校正ロジック（CLI としても動く）
 - `patentproof/app/server.py` — Web UI とジョブキュー（標準ライブラリの http.server、ワーカー1本で直列実行）
-- `templates/deployment.yaml` — python:3.12-slim を使い、起動時に python-docx / pypdf / janome を pip で入れる。アプリのコードは configmap で渡す
+- `templates/deployment.yaml` — python:3.12-slim を使い、起動時に python-docx / pypdf / janome / regex を pip で入れる。アプリのコードは configmap で渡す
 - `icon.png` — アプリアイコン（Manifest からは raw.githubusercontent.com の URL で参照している）
 
 ## 処理の流れ
@@ -29,6 +29,8 @@ LLM の呼び出しごとの秒数・トークン数・finish_reason は `LLM.st
 
 ## データセット（マニュアル）
 - 保存先は APP_DATA/dataset：index.json（一覧）、`<id>.txt`（本文）、`<id>.chunks.json`（チャンクと埋め込み）、`<id>.rules.json`（ルール）、`<id>.orig.<拡張子>`（元ファイル）
+- 書き込みは `write_atomic`（一時ファイルから置き換え）。マニュアルには版番号 `rev` があり、バックグラウンドの処理は `ds_save_if_current` で版が変わっていないときだけ結果を書く（編集・再処理のあとに古い結果で上書きしない）
+- 埋め込みは `embed_model` が変わったら計算し直す（`is_embedded`）。解析・埋め込みは `ds_lock` の外で行う
 - 取り込みは2段階。アップロード時は `ds_ingest` で CPU の処理だけ（文字の取り出し・`chunk_text`・書式からのルール読み取り）をしてすぐ返す。GPU の処理は `run_ds_task` を校正と同じワーカーのキューに入れ、1件ずつ行う
   - 順序：画像の OCR（PaddleOCR が動いているときだけ。PDF は文字のないページを `OCR_PAGES` ずつ）→ 埋め込み（`EMBED_BATCH` ずつ）→ LLM でのルール読み取り（`llm_manual_rules`）
 - チャンクには項目番号（［M1-3］）を振る。校正では、使用中のマニュアルが `MANUAL_WARN_CHARS` 字以下なら全文、超えたら区切りごとに埋め込みで近い `top_k` 項目だけを `MANUAL_FOR` で渡す（設定で全文・検索に固定できる）
@@ -36,7 +38,8 @@ LLM の呼び出しごとの秒数・トークン数・finish_reason は `LLM.st
 - ルール（`RULE_TYPES`）：replace / forbid / regex / ignore / symbol_exclude / symbol_prefix
   - 書式からは `parse_manual_rules` で読み取る（矢印、かぎ括弧の「とする」「ではなく」「使わない」「指摘しない」、誤／正の表）
   - LLM からは `llm_manual_rules` で読み取る。LLM が読み取ったルールの指摘は要確認にする
-  - `validate_rule` で、入れ子の繰り返しや何にでも当たる正規表現をはじく
+  - `validate_rule` は正規表現を走らせずに `risky_regex`（構文の解析）で、入れ子の繰り返し・繰り返しの中の分岐・上限のない繰り返し3つ以上・後方参照をはじく。当てはめは `regex` パッケージの時間制限（`REGEX_TIMEOUT`）つき
+  - 書式から読み取った置換のうち、言い切れる書き方（かぎ括弧と「とする」などの指示語、誤／正の表、×○）だけが sure=True で変更履歴になる。かぎ括弧のない矢印の行や LLM が読み取ったものは要確認。「〜てもよい」「区別」「場合もある」を含む行からは置換を読まない
   - 校正では `manual_rule_checks` で当てはめ、symbol_exclude / symbol_prefix は `configure_symbols` で符号の抽出に足し、ignore は `is_ignored` で指摘を外す
 
 ## 守ること

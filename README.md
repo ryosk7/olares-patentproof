@@ -104,7 +104,7 @@ During proofreading:
 ## Environment
 
 - Olares 1.12.6 or later (amd64 / arm64)
-- Internet access is needed on first start to install python-docx, pypdf and janome from PyPI
+- Internet access is needed on first start to install python-docx, pypdf, janome and regex from PyPI
 
 ## License
 

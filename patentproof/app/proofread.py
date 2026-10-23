@@ -316,11 +316,17 @@ def rule_checks(paras: list[Para], table: dict[str, dict] | None = None) -> list
 # ---------------------------------------------------------------------------
 RULE_TYPES = ("replace", "forbid", "regex", "ignore", "symbol_exclude", "symbol_prefix")
 _Q = r"[「『\"“]([^」』\"”]{1,30})[」』\"”]"
+# 置換の指示を表す言い方（「は」「を」で区切る書き方は、これがあるときだけ置換とみなす）
+_DIRECTIVE = r"(?:に統一|とする|と表記する|と記載する|と書く|に改める|に直す|に修正する|を用いる|を使う|とすること|と表記すること|とし(?=[、，,]))"
+# 置換の決まりではない言い方（「〜としてもよい」「〜と区別する」「〜場合もある」など）を含む行からは置換を読み取らない
+_HEDGE = re.compile(r"てもよい|ても良い|場合もある|こともある|差し支え|区別|同じ意味|同義|可とする|例外|ことがある")
 _FMT_RULES = [
-    # 「Ａ」→「Ｂ」 / 「Ａ」は「Ｂ」とする・に統一する・と表記する / 「Ａ」を「Ｂ」に改める
-    (re.compile(_Q + r"\s*(?:→|⇒|->|＞|は|を)\s*" + _Q + r"\s*(?:→|⇒)?\s*(?:に統一|とする|と表記|と記載|と書|に改め|に直|に修正|を用い|を使)?"), "replace", 1, 2),
-    # 「Ｂ」とし、「Ａ」としない / 「Ａ」ではなく「Ｂ」
-    (re.compile(_Q + r"\s*(?:ではなく|でなく|ではなし)\s*" + _Q), "replace", 1, 2),
+    # 「Ａ」→「Ｂ」
+    (re.compile(_Q + r"\s*(?:→|⇒|->)\s*" + _Q), "replace", 1, 2),
+    # 「Ａ」は「Ｂ」とする・に統一する・と表記する / 「Ａ」を「Ｂ」に改める
+    (re.compile(_Q + r"\s*(?:は|を)\s*" + _Q + r"\s*" + _DIRECTIVE), "replace", 1, 2),
+    # 「Ａ」ではなく「Ｂ」を用いる・とする
+    (re.compile(_Q + r"\s*(?:ではなく|でなく)\s*" + _Q + r"\s*" + _DIRECTIVE), "replace", 1, 2),
     # ×Ａ ○Ｂ / 誤：Ａ 正：Ｂ / （誤）Ａ（正）Ｂ / ＮＧ：Ａ ＯＫ：Ｂ
     (re.compile(r"(?:×|✕|✗|誤[：:)）]|[（(]誤[)）]|NG[：:]|ＮＧ[：:])\s*「?([^\s「」○◯〇正×]{1,30}?)」?\s*[、，,／/]?\s*(?:○|◯|〇|正[：:)）]|[（(]正[)）]|OK[：:]|ＯＫ[：:])\s*「?([^\s「」×]{1,30}?)」?(?=\s|$|。|、)"), "replace", 1, 2),
     # 「Ａ」は使わない・使用しない・用いない・禁止
@@ -330,10 +336,12 @@ _FMT_RULES = [
 ]
 _ARROW_LINE = re.compile(r"^[\s・\-*●○■□◆◇]*([^\s→⇒｜|]{1,20})\s*(?:→|⇒)\s*([^\s→⇒｜|]{1,20})\s*$")
 _TABLE_HEAD = re.compile(r"^(?:誤|NG|ＮＧ|修正前|×|旧|誤り|不可)\s*[｜|]\s*(?:正|OK|ＯＫ|修正後|○|新|正しい|可)")
+_CLAUSE_END = "。、，,；;"
 
 
 def parse_manual_rules(chunks: list[dict]) -> list[dict]:
-    """マニュアルの書き方（矢印・かぎ括弧・誤／正の表など）から、機械的に当てはめられるルールを読み取る（LLM は使わない）"""
+    """マニュアルの書き方（矢印・かぎ括弧と指示語・誤／正の表など）から、機械的に当てはめられるルールを読み取る（LLM は使わない）。
+    sure=True は書き方から置換の決まりだと言い切れるもの。かぎ括弧のない矢印の行などは sure=False（指摘は要確認になる）"""
     out: list[dict] = []
     for c in chunks:
         in_table = False
@@ -345,28 +353,79 @@ def parse_manual_rules(chunks: list[dict]) -> list[dict]:
             cols = [x.strip(" 「」") for x in re.split(r"[｜|]", line)] if "｜" in line or "|" in line else []
             if in_table and len(cols) >= 2:
                 if cols[0] and cols[1] and cols[0] != cols[1] and len(cols[0]) <= 30 and len(cols[1]) <= 30:
-                    out.append({"type": "replace", "from": cols[0], "to": cols[1], "note": line[:60], "cid": c["cid"], "by": "書式"})
+                    out.append({"type": "replace", "from": cols[0], "to": cols[1], "note": line[:60], "cid": c["cid"], "by": "書式", "sure": True})
                 continue
             in_table = False
-            m = _ARROW_LINE.match(line)
-            if m and m.group(1) != m.group(2):
-                out.append({"type": "replace", "from": m.group(1).strip("「」"), "to": m.group(2).strip("「」"), "note": line[:60], "cid": c["cid"], "by": "書式"})
+            hedge = bool(_HEDGE.search(line))
+            m = _ARROW_LINE.match(line) if "「" not in line and "『" not in line else None  # かぎ括弧つきは下の決まった書き方で読む
+            if m and m.group(1) != m.group(2) and not hedge:
+                out.append({"type": "replace", "from": m.group(1).strip("「」"), "to": m.group(2).strip("「」"), "note": line[:60],
+                            "cid": c["cid"], "by": "書式", "sure": False})
                 continue
             for rx, typ, a, b in _FMT_RULES:
                 for m in rx.finditer(line):
                     if typ == "replace":
                         frm, to = m.group(a), m.group(b)  # 「Ａ」ではなく「Ｂ」も Ａ を Ｂ に
-                        if frm != to:
-                            out.append({"type": typ, "from": frm, "to": to, "note": line[:60], "cid": c["cid"], "by": "書式"})
+                        if frm != to and not hedge:
+                            out.append({"type": typ, "from": frm, "to": to, "note": line[:60], "cid": c["cid"], "by": "書式", "sure": True})
                     else:
-                        # 「Ａ」「Ｂ」は指摘しない のように並んだ語はすべて対象にする
-                        words = re.findall(_Q, line[:m.end()]) or [next(g for g in m.groups() if g)]
+                        # 「Ａ」「Ｂ」は指摘しない のように並んだ語は対象にする。ただし同じ節（読点・句点の後ろ）の語だけ
+                        head = max(line.rfind(ch, 0, m.start()) for ch in _CLAUSE_END) + 1
+                        words = re.findall(_Q, line[head:m.end()]) or [next(g for g in m.groups() if g)]
                         for word in words:
                             out.append({"type": typ, "from": word, "to": "", "note": line[:60], "cid": c["cid"], "by": "書式"})
     return dedupe_rules(out)
 
 
-_BAD_REGEX = re.compile(r"\((?:[^()\\]|\\.)*[+*](?:[^()\\]|\\.)*\)[+*{]")  # (a+)+ のような入れ子の繰り返し（極端に遅くなる）
+try:  # 正規表現のルールに時間制限をかけるため（なければ標準の re。その場合も risky_regex で危ない形ははじく）
+    import regex as _regex
+except ImportError:
+    _regex = None
+REGEX_TIMEOUT = 2.0  # 正規表現のルール1つを1段落に当てる時間の上限（秒）
+
+
+def risky_regex(pattern: str) -> bool:
+    """極端に遅くなりうる正規表現か（構文を解析して調べる。実際に走らせない）。
+    繰り返しの中に繰り返しや分岐がある（(a+)+、(a|aa)+）、上限のない繰り返しが3つ以上ある（\\w*\\w*\\w*）、後方参照があるものを危ないとみなす"""
+    try:
+        from re import _parser as sp, _constants as sc
+    except ImportError:  # Python 3.10 以前
+        import sre_parse as sp, sre_constants as sc
+    try:
+        tree = sp.parse(pattern)
+    except Exception:
+        return True
+    reps = {sc.MAX_REPEAT, sc.MIN_REPEAT} | ({sc.POSSESSIVE_REPEAT} if hasattr(sc, "POSSESSIVE_REPEAT") else set())
+    unbounded = [0]
+
+    def walk(items, in_repeat: bool) -> bool:
+        for op, av in items:
+            if op in reps:
+                lo, hi, sub = av
+                if hi == sc.MAXREPEAT or hi > 100:
+                    unbounded[0] += 1
+                if in_repeat or walk(sub, True):
+                    return True
+            elif op == sc.BRANCH:
+                if in_repeat or any(walk(b, in_repeat) for b in av[1]):
+                    return True
+            elif op == sc.SUBPATTERN:
+                if walk(av[-1], in_repeat):
+                    return True
+            elif op in (sc.ASSERT, sc.ASSERT_NOT):
+                if walk(av[1], in_repeat):
+                    return True
+            elif op in (sc.GROUPREF, sc.GROUPREF_EXISTS):
+                return True
+            elif in_repeat and op == sc.IN:
+                continue
+        return False
+
+    return walk(tree, False) or unbounded[0] > 2
+
+
+def compile_rule(pattern: str):
+    return _regex.compile(pattern) if _regex else re.compile(pattern)
 
 
 def validate_rule(r: dict) -> dict | None:
@@ -379,26 +438,30 @@ def validate_rule(r: dict) -> dict | None:
     if not frm or len(frm) > 200:
         return None
     if typ == "regex":
-        if _BAD_REGEX.search(frm):
+        if risky_regex(frm):
             return None
         try:
             rx = re.compile(frm)
         except re.error:
             return None
-        if rx.search("") is not None or rx.search("あいうえお" * 20) and len(rx.search("あいうえお" * 20).group(0)) > 50:
-            return None  # 空文字や何にでも当たるパターンは使わない
+        if rx.match("") is not None:
+            return None  # 空文字に当たるパターン（.* など）は使わない
     elif len(frm) > 30 or (typ == "replace" and (not to or to == frm)):
         return None
     return {"type": typ, "from": frm, "to": to, "note": str(r.get("note") or "")[:120], "cid": r.get("cid", ""),
-            "by": r.get("by", "LLM"), "enabled": r.get("enabled", True)}
+            "by": r.get("by", "LLM"), "sure": bool(r.get("sure")) and r.get("by") == "書式", "enabled": r.get("enabled", True)}
+
+
+def rule_key(r: dict) -> str:
+    return f"{r['type']}\t{r['from']}\t{r['to']}"
 
 
 def dedupe_rules(rules: list[dict]) -> list[dict]:
     seen, out = set(), []
     for r in rules:
         r = validate_rule(r)
-        if r and (r["type"], r["from"], r["to"]) not in seen:
-            seen.add((r["type"], r["from"], r["to"]))
+        if r and rule_key(r) not in seen:
+            seen.add(rule_key(r))
             out.append(r)
     return out
 
@@ -440,12 +503,23 @@ def manual_rule_checks(paras: list[Para], rules: list[dict], max_hits: int = 50)
     for r in rules:
         if not r.get("enabled", True) or r["type"] not in ("replace", "forbid", "regex"):
             continue
-        rx = re.compile(r["from"]) if r["type"] == "regex" else re.compile(re.escape(r["from"]))
+        if r["type"] == "regex":
+            if risky_regex(r["from"]):  # 古いデータに残っていた危ない正規表現は使わない
+                continue
+            rx = compile_rule(r["from"])
+        else:
+            rx = re.compile(re.escape(r["from"]))
         cite = f" 根拠［{r['cid']}］" if r.get("cid") else ""
-        check = r.get("by") != "書式" or r["type"] != "replace"  # LLM が読み取ったルールと、言い換えの決まっていない指摘は要確認
+        # 書き方から置換の決まりだと言い切れるものだけ要確認にしない（LLM が読み取ったもの・禁止語・正規表現は要確認）
+        check = not (r["type"] == "replace" and r.get("sure"))
         hits = 0
         for p in paras:
-            for m in rx.finditer(p.text):
+            try:
+                matches = list(rx.finditer(p.text, timeout=REGEX_TIMEOUT) if _regex and r["type"] == "regex" else rx.finditer(p.text))
+            except TimeoutError:
+                log(f"マニュアルの規則「{r['from']}」は時間がかかりすぎるため、この段落では使いません")
+                continue
+            for m in matches:
                 s, e = m.span()
                 if s == e:
                     continue
@@ -475,14 +549,19 @@ def manual_rule_checks(paras: list[Para], rules: list[dict], max_hits: int = 50)
 
 
 def is_ignored(f: Finding, words: list[str]) -> bool:
-    """「指摘しない語」だけを直す指摘か（直す部分が指摘しない語に含まれる、または指摘しない語そのもの）"""
+    """「指摘しない語」を直す指摘か。直す位置が、引用中の指摘しない語の位置と重なるときだけ外す。
+    修正案のない指摘は、引用が指摘しない語そのもののときだけ外す"""
     if not words:
         return False
-    if f.after:
-        s, e, new = minimal_edit(f.before, f.after)
-        old = f.before[s:e]
-        return any((old and old in w) or (new and new in w) or w == norm(f.before) for w in words)
-    return any(w == norm(f.before) for w in words)
+    if not f.after:
+        return any(w == norm(f.before) for w in words)
+    s, e, _ = minimal_edit(f.before, f.after)
+    for w in words:
+        for m in re.finditer(re.escape(w), f.before):
+            i, j = m.span()
+            if (s < j and i < e) or (s == e and i < s < j):
+                return True
+    return False
 
 
 # 同じ語の重複（形態素解析）。例: 「のの」「装置装置」「受け取って受け取った」「貯留し貯留する」
@@ -753,6 +832,8 @@ class LLM:
             headers["Authorization"] = "Bearer " + self.api_key
         delay = 5
         for attempt in range(8):
+            if attempt and BEFORE_CALL:
+                BEFORE_CALL()  # 再試行のときも中止を反映する
             try:
                 t0 = time.time()
                 req = urllib.request.Request(self.url, data=body, headers=headers)
@@ -1170,7 +1251,11 @@ def apply_to_docx(doc, findings: list[Finding]):
     for f in sorted(findings, key=lambda f: (f.para_idx, -(f.start or 0))):
         p = doc.paragraphs[f.para_idx]
         text = p.text
-        bi = text.find(f.before)
+        # 指摘の位置（start）を優先する。同じ段落に同じ引用が複数あっても、指摘した箇所に付ける
+        if f.start is not None and text[f.start:f.start + len(f.before)] == f.before:
+            bi = f.start
+        else:
+            bi = text.find(f.before)
         if bi < 0:
             bi = f.start or 0
         comment = f"【{f.kind}】{f.before} → {f.after or '（要確認）'}"

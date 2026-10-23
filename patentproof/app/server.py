@@ -120,7 +120,7 @@ def ds_items() -> list[dict]:
     idx = d / "index.json"
     if not idx.exists():
         items: list[dict] = []
-        idx.write_text("[]", encoding="utf-8")
+        write_atomic(idx, "[]")
         # 旧版で設定画面に書いた校正方針をデータセットへ移す
         cfg = load_config()
         if (cfg.get("manual") or "").strip():
@@ -138,8 +138,15 @@ def ds_items() -> list[dict]:
     return items
 
 
+def write_atomic(path: Path, text: str):
+    """一時ファイルに書いてから置き換える（書きかけのファイルを別のスレッドが読まないように）"""
+    tmp = path.with_name(f".{path.name}.{threading.get_ident()}.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
 def ds_save(items: list[dict]):
-    (ds_dir() / "index.json").write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_atomic(ds_dir() / "index.json", json.dumps(items, ensure_ascii=False, indent=2))
 
 
 def ds_text(item_id: str) -> str:
@@ -278,32 +285,21 @@ def ds_rules(item_id: str) -> list[dict]:
     return json.loads(f.read_text(encoding="utf-8")) if f.exists() else []
 
 
-def _write_chunks_rules(item: dict, text: str, llm_rules: list[dict] | None = None):
-    """本文 → チャンク分割 → 書式からのルール読み取り（すべて CPU）。LLM で読み取ったルールは渡されたものを足す"""
+def _write_chunks_rules(item: dict, text: str):
+    """本文 → チャンク分割 → 書式からのルール読み取り（すべて CPU）。LLM で読み取ったルールは次の LLM の処理で読み直す。
+    版番号（rev）を上げ、それより前に始まったバックグラウンドの処理が古い結果を書き戻さないようにする"""
     d = ds_dir()
-    (d / f"{item['id']}.txt").write_text(text, encoding="utf-8")
+    write_atomic(d / f"{item['id']}.txt", text)
     chunks = [{"cid": f"{item['code']}-{i}", "text": c, "vec": None} for i, c in enumerate(chunk_text(text), 1)]
-    old = {r["type"] + r["from"] + r["to"]: r.get("enabled", True) for r in ds_rules(item["id"])}
-    rules = pr.dedupe_rules(pr.parse_manual_rules(chunks) + (llm_rules or []))
+    old = {pr.rule_key(r): r.get("enabled", True) for r in ds_rules(item["id"])}
+    rules = pr.parse_manual_rules(chunks)
     for r in rules:  # 画面で切ったルールは、読み直しても切ったままにする
-        r["enabled"] = old.get(r["type"] + r["from"] + r["to"], True)
-    (d / f"{item['id']}.chunks.json").write_text(json.dumps(chunks, ensure_ascii=False), encoding="utf-8")
-    (d / f"{item['id']}.rules.json").write_text(json.dumps(rules, ensure_ascii=False, indent=1), encoding="utf-8")
-    item.update(chars=len(text), chunks=len(chunks), rules=len(rules), rules_llm=sum(1 for r in rules if r["by"] == "LLM"),
-                embedded=False, updated=time.time())
+        r["enabled"] = old.get(pr.rule_key(r), True)
+    write_atomic(d / f"{item['id']}.chunks.json", json.dumps(chunks, ensure_ascii=False))
+    write_atomic(d / f"{item['id']}.rules.json", json.dumps(rules, ensure_ascii=False, indent=1))
+    item.update(chars=len(text), chunks=len(chunks), rules=len(rules), rules_llm=0, embedded=False, updated=time.time(),
+                rev=item.get("rev", 0) + 1, note="", task="処理待ち", llm_done=False)
     return chunks
-
-
-def ds_ingest(item: dict, text: str | None = None) -> dict:
-    """取り込みのうち CPU の処理だけをすぐに行う（文字の取り出し・チャンク分割・書式からのルール読み取り）。
-    画像の OCR・埋め込み・LLM でのルール読み取り（GPU）は ds_task としてワーカーに回し、校正と同時に GPU を使わない"""
-    if text is None:
-        text, item["images"], item["images_unread"] = extract_text(item["name"], _orig(item).read_bytes(), ocr=False)
-    _write_chunks_rules(item, text)
-    item["note"] = ""
-    item["task"] = "処理待ち"
-    item["llm_done"] = False
-    return item
 
 
 def ds_enqueue(item_id: str):
@@ -311,7 +307,11 @@ def ds_enqueue(item_id: str):
 
 
 def ds_put(name: str, data: bytes, source: str) -> tuple[dict, bool]:
-    """同じ名前があれば内容を差し替える（更新）。なければ追加する。戻り値: (項目, 更新したか)"""
+    """同じ名前があれば内容を差し替える（更新）。なければ追加する。戻り値: (項目, 更新したか)。
+    文字の取り出しはロックの外で先に行い、取り出せなければ既存のものには触らない"""
+    text, images, unread = extract_text(name, data, ocr=False)
+    if not text and not images:
+        raise ValueError("文字を取り出せませんでした")
     with ds_lock:
         items = ds_items()
         cur = next((x for x in items if x["name"] == name), None)
@@ -321,41 +321,44 @@ def ds_put(name: str, data: bytes, source: str) -> tuple[dict, bool]:
             n = max([int(x["code"][1:]) for x in items] or [0]) + 1
             item = {"id": f"{int(time.time() * 1000):x}", "code": f"M{n}", "name": name, "enabled": True}
             items.append(item)
-        item["source"] = source
+        item.update(source=source, images=images, images_unread=unread)
         _orig(item).write_bytes(data)
-        try:
-            ds_ingest(item)
-        except Exception:
-            if not cur:
-                _orig(item).unlink(missing_ok=True)
-            raise
+        _write_chunks_rules(item, text)
         ds_save(items)
     ds_enqueue(item["id"])
     return item, bool(cur)
 
 
 def ds_update(item_id: str, **kw):
+    # 再処理で元ファイルから読み直すときは、解析をロックの外で先に行う
+    pre = None
+    if kw.get("reprocess"):
+        item = next(x for x in ds_items() if x["id"] == item_id)
+        if item.get("source") != "画面で編集" and _orig(item).exists():
+            pre = extract_text(item["name"], _orig(item).read_bytes(), ocr=False)
     with ds_lock:
         items = ds_items()
         item = next(x for x in items if x["id"] == item_id)
         queue_it = False
         if "text" in kw:
-            item["source"] = "画面で編集"
-            ds_ingest(item, kw["text"])
+            item.update(source="画面で編集", images_unread=0)  # 編集した本文を正とする（画像を読み直して上書きしない）
+            _write_chunks_rules(item, kw["text"])
             queue_it = True
         if kw.get("reprocess"):
-            if item.get("source") == "画面で編集" or not _orig(item).exists():
-                ds_ingest(item, ds_text(item_id))  # 編集した本文はそのまま、チャンク・ルール・埋め込みをやり直す
+            if pre:
+                item.update(images=pre[1], images_unread=pre[2])
+                _write_chunks_rules(item, pre[0])
             else:
-                ds_ingest(item)
+                _write_chunks_rules(item, ds_text(item_id))  # 編集した本文はそのまま、チャンク・ルール・埋め込みをやり直す
             queue_it = True
         if "enabled" in kw:
             item["enabled"] = kw["enabled"]
-        if "rule" in kw:  # ルール1件の使用オン／オフ
+        if "rule_key" in kw:  # ルール1件の使用オン／オフ（並び順ではなく中身で指定する）
             rules = ds_rules(item_id)
-            if 0 <= kw["rule"] < len(rules):
-                rules[kw["rule"]]["enabled"] = kw["rule_on"]
-                (ds_dir() / f"{item_id}.rules.json").write_text(json.dumps(rules, ensure_ascii=False, indent=1), encoding="utf-8")
+            for r in rules:
+                if pr.rule_key(r) == kw["rule_key"]:
+                    r["enabled"] = kw["rule_on"]
+            write_atomic(ds_dir() / f"{item_id}.rules.json", json.dumps(rules, ensure_ascii=False, indent=1))
         ds_save(items)
     if queue_it:
         ds_enqueue(item_id)
@@ -540,79 +543,101 @@ class step:
         return False
 
 
-def ds_fill_vectors(cfg: dict) -> int:
-    """使用オンのマニュアルで埋め込みが未計算のチャンクを計算して保存する。計算した数を返す"""
-    n = 0
+class Stale(Exception):
+    """処理中にマニュアルが更新・削除された（新しい処理がキューに入っているので、この結果は捨てる）"""
+
+
+def is_embedded(x: dict, cfg: dict) -> bool:
+    """今の埋め込みモデルで計算済みか（モデルを変えたら計算し直す）"""
+    return bool(x.get("embedded")) and x.get("embed_model") == embed_model(cfg)
+
+
+def ds_save_if_current(item_id: str, rev: int, files: dict[str, str] | None = None, **kw) -> dict:
+    """マニュアルが rev のままなら、ファイルと一覧の項目を書く。変わっていれば Stale"""
     with ds_lock:
         items = ds_items()
-        for x in items:
-            if not x.get("enabled") or x.get("embedded"):
-                continue
-            chunks = ds_chunks(x["id"])
-            if not chunks and (ds_dir() / f"{x['id']}.txt").exists():  # チャンク分割より前の版で取り込んだもの
-                chunks = _write_chunks_rules(x, ds_text(x["id"]))
-            if chunks:
-                for c, v in zip(chunks, embed([c["text"] for c in chunks], cfg)):
-                    c["vec"] = v
-                (ds_dir() / f"{x['id']}.chunks.json").write_text(json.dumps(chunks, ensure_ascii=False), encoding="utf-8")
-                n += len(chunks)
-            x.update(embedded=True, embed_model=embed_model(cfg))
-            x["note"] = ""
+        it = next((x for x in items if x["id"] == item_id), None)
+        if it is None or it.get("rev", 0) != rev:
+            raise Stale()
+        for name, text in (files or {}).items():
+            write_atomic(ds_dir() / name, text)
+        it.update(kw)
         ds_save(items)
+        return it
+
+
+def ds_fill_vectors(cfg: dict) -> int:
+    """使用オンのマニュアルで、今のモデルの埋め込みがないものを計算して保存する（計算はロックの外）。計算した数を返す"""
+    n = 0
+    model = embed_model(cfg)
+    for x in ds_items():
+        if not x.get("enabled") or is_embedded(x, cfg):
+            continue
+        chunks = ds_chunks(x["id"])
+        if not chunks and (ds_dir() / f"{x['id']}.txt").exists():  # チャンク分割より前の版で取り込んだもの
+            with ds_lock:
+                items = ds_items()
+                it = next(y for y in items if y["id"] == x["id"])
+                chunks = _write_chunks_rules(it, ds_text(x["id"]))
+                ds_save(items)
+                x = it
+        if not chunks:
+            continue
+        for c, v in zip(chunks, embed([c["text"] for c in chunks], cfg)):
+            c["vec"] = v
+        try:
+            ds_save_if_current(x["id"], x.get("rev", 0), {f"{x['id']}.chunks.json": json.dumps(chunks, ensure_ascii=False)},
+                               embedded=True, embed_model=model)
+            n += len(chunks)
+        except Stale:
+            pass
     return n
 
 
 def run_ds_task(item_id: str):
     """マニュアルの GPU の処理（画像の OCR → 埋め込み → LLM でのルール読み取り）。
-    校正と同じワーカーで1件ずつ、段階ごとに順番に動くので、OCR・埋め込み・LLM が同時に GPU を使わない。段階ごとに保存し、メモリはその都度返す"""
-    def get():
-        return next((x for x in ds_items() if x["id"] == item_id), None)
-
+    校正と同じワーカーで1件ずつ、段階ごとに順番に動くので、OCR・埋め込み・LLM が同時に GPU を使わない。
+    段階ごとに保存し、メモリはその都度返す。途中でマニュアルが更新・削除されたら、古い結果は書かずにやめる"""
     def update(**kw):
-        with ds_lock:
-            items = ds_items()
-            it = next((x for x in items if x["id"] == item_id), None)
-            if it is None:
-                raise Cancelled()  # 処理中に削除された
-            it.update(kw)
-            ds_save(items)
-            return it
+        return ds_save_if_current(item_id, rev, **kw)
 
-    item = get()
-    if item is None:
-        return
-    cfg = load_config()
-    apply_config(cfg)
     notes = []
     pr.log = lambda m: None
     try:
-        # 1) 画像の OCR（PaddleOCR が動いているときだけ。動いていなければ未読み取りのまま）
-        if item.get("images_unread") and _orig(item).exists():
+        item = next((x for x in ds_items() if x["id"] == item_id), None)
+        if item is None:
+            return
+        rev = item.get("rev", 0)
+        cfg = load_config()
+        apply_config(cfg)
+        # 1) 画像の OCR（PaddleOCR が動いているときだけ。画面で編集したものは編集した本文を正とするので読み直さない）
+        if item.get("images_unread") and item.get("source") != "画面で編集" and _orig(item).exists():
             if ocr_running(force=True):
                 update(task=f"画像の読み取り中（{item['images_unread']} 件）")
                 text, images, unread = extract_text(item["name"], _orig(item).read_bytes(), ocr=True)
                 with ds_lock:
                     items = ds_items()
-                    it = next(x for x in items if x["id"] == item_id)
+                    it = next((x for x in items if x["id"] == item_id), None)
+                    if it is None or it.get("rev", 0) != rev:
+                        raise Stale()
                     it.update(images=images, images_unread=unread)
                     _write_chunks_rules(it, text)
+                    it["task"] = "処理中"
+                    rev = it["rev"]
                     ds_save(items)
                 gc.collect()
             else:
                 notes.append("PaddleOCR が停止中のため画像は未読み取り（起動してから「再処理」）")
 
-        # 2) 埋め込み（EMBED_BATCH 件ずつ）
+        # 2) 埋め込み（EMBED_BATCH 件ずつ。計算はロックの外）
         chunks = ds_chunks(item_id)
         if chunks:
             update(task="埋め込みを計算中")
             try:
-                vecs = embed([c["text"] for c in chunks], cfg)
-                for c, v in zip(chunks, vecs):
+                for c, v in zip(chunks, embed([c["text"] for c in chunks], cfg)):
                     c["vec"] = v
-                with ds_lock:
-                    (ds_dir() / f"{item_id}.chunks.json").write_text(json.dumps(chunks, ensure_ascii=False), encoding="utf-8")
-                update(embedded=True, embed_model=embed_model(cfg))
-            except Cancelled:
+                update(files={f"{item_id}.chunks.json": json.dumps(chunks, ensure_ascii=False)}, embedded=True, embed_model=embed_model(cfg))
+            except Stale:
                 raise
             except Exception as e:
                 notes.append(f"埋め込みは未計算（{str(e)[:80]}）")
@@ -623,40 +648,37 @@ def run_ds_task(item_id: str):
         if cfg.get("rule_llm", "1") == "1":
             chunks = ds_chunks(item_id)
             llm = pr.LLM(cfg["llm_base_url"], cfg["llm_model"], cfg["llm_api_key"] or None, verbose=False)
-            def stop_if_deleted():
-                if get() is None:
-                    raise Cancelled()
-            pr.BEFORE_CALL = stop_if_deleted
+
+            def stop_if_changed():
+                it = next((x for x in ds_items() if x["id"] == item_id), None)
+                if it is None or it.get("rev", 0) != rev:
+                    raise Stale()
+            pr.BEFORE_CALL = stop_if_changed
             got: list[dict] = []
             try:
                 for i, c in enumerate(chunks, 1):
                     update(task=f"LLM でルールを読み取り中 {i}/{len(chunks)}")
                     got += pr.llm_manual_rules(llm, c)
-            except Cancelled:
+            except Stale:
                 raise
             except BaseException as e:  # LLM に届かないなど（SystemExit を含む）。書式から読み取ったルールは残す
                 notes.append(f"LLM でのルール読み取りは途中まで（{str(e)[:80]}）")
             finally:
                 pr.BEFORE_CALL = None
-            with ds_lock:
-                items = ds_items()
-                it = next((x for x in items if x["id"] == item_id), None)
-                if it is None:
-                    raise Cancelled()
-                old = {r["type"] + r["from"] + r["to"]: r.get("enabled", True) for r in ds_rules(item_id)}
-                rules = pr.dedupe_rules([r for r in ds_rules(item_id) if r["by"] != "LLM"] + got)
-                for r in rules:
-                    r["enabled"] = old.get(r["type"] + r["from"] + r["to"], True)
-                (ds_dir() / f"{item_id}.rules.json").write_text(json.dumps(rules, ensure_ascii=False, indent=1), encoding="utf-8")
-                it.update(rules=len(rules), rules_llm=sum(1 for r in rules if r["by"] == "LLM"), llm_done=True)
-                ds_save(items)
+            old = ds_rules(item_id)
+            on = {pr.rule_key(r): r.get("enabled", True) for r in old}
+            rules = pr.dedupe_rules([r for r in old if r["by"] != "LLM"] + got)
+            for r in rules:
+                r["enabled"] = on.get(pr.rule_key(r), True)
+            update(files={f"{item_id}.rules.json": json.dumps(rules, ensure_ascii=False, indent=1)},
+                   rules=len(rules), rules_llm=sum(1 for r in rules if r["by"] == "LLM"), llm_done=True)
         update(task="", note=" / ".join(notes))
-    except Cancelled:
+    except Stale:
         pass
     except Exception as e:
         try:
             update(task="", note=f"処理できませんでした: {str(e)[:120]}")
-        except Cancelled:
+        except Exception:
             pass
     finally:
         pr.BEFORE_CALL = None
@@ -684,7 +706,8 @@ def prepare_manual(job: dict, cfg: dict, paras, seg_chars: int):
             order_of = {c["cid"]: i for i, c in enumerate(chunks)}
             picks = []
             for v in qv:
-                top = sorted((c for c in chunks if c.get("vec")), key=lambda c: -_cos(v, c["vec"]))[:k]
+                usable = [c for c in chunks if c.get("vec") and len(c["vec"]) == len(v)]  # 別のモデルで計算したものは使わない
+                top = sorted(usable, key=lambda c: -_cos(v, c["vec"]))[:k]
                 picks.append(numbered(sorted(top, key=lambda c: order_of[c["cid"]])))
             pr.MANUAL_FOR = lambda gi, picks=picks: picks[gi] if gi < len(picks) else pr.MANUAL
             st["note"] = f"区切り {len(groups)} × 上位 {k} 項目（全 {len(chunks)} 項目）"
@@ -705,7 +728,13 @@ def worker():
     while True:
         jid = q.get()
         if isinstance(jid, tuple):  # ("ds", マニュアルの id)
-            run_ds_task(jid[1])
+            try:
+                run_ds_task(jid[1])
+            except BaseException:  # ここで止まるとワーカーが死に、以後どのジョブも動かなくなる
+                traceback.print_exc()
+            q.task_done()
+            continue
+        if jid not in jobs:
             q.task_done()
             continue
         job = jobs[jid]
@@ -1064,8 +1093,8 @@ function filter() { const v = $('#q').value.trim().toLowerCase(); document.query
 
 // 一覧の更新（実行中は数秒ごと）
 async function refresh() {
-  const r = await fetch('/api/rows'); if (!r.ok) return;
-  const d = await r.json();
+  let d;
+  try { const r = await fetch('/api/rows'); if (!r.ok) throw 0; d = await r.json(); } catch (_) { clearTimeout(window._poll); window._poll = setTimeout(refresh, 4000); return; }
   $('#rows').innerHTML = d.rows; $('#stats').innerHTML = d.stats; filter();
   if (fresh) { const tr = [...document.querySelectorAll('#rows tr[data-name]')].find(t => t.dataset.name === fresh); if (tr) tr.classList.add('new'); fresh = null; }
   clearTimeout(window._poll); if (d.busy) window._poll = setTimeout(refresh, 4000);
@@ -1208,7 +1237,7 @@ def page_settings(msg: str = "") -> str:
         return f"<input name={name} type={typ} value=\"{html.escape(str(val))}\">"
 
     sel = lambda name, val, choices: f"<select name={name}>" + "".join(f"<option {'selected' if c == val else ''}>{c}</option>" for c in choices) + "</select>"
-    sel_kv = lambda name, val, choices: f"<select name={name}>" + "".join(f"<option value={k} {'selected' if k == val else ''}>{v}</option>" for k, v in choices) + "</select>"
+    sel_kv = lambda name, val, choices: f"<select name={name}>" + "".join(f"<option value=\"{html.escape(k)}\" {'selected' if k == val else ''}>{v}</option>" for k, v in choices) + "</select>"
     badge = lambda k: f"<span class='tag {'ok' if st[k][0] == 'ok' else 'ng' if st[k][0] == 'ng' else ''}'>{html.escape(st[k][1])}</span>"
     toast = f"<script>const t=document.getElementById('toast');t.textContent={json.dumps(msg)};t.classList.add('show');setTimeout(()=>t.classList.remove('show'),3000)</script>" if msg else ""
     body = f"""<div class=head><div><h1>設定</h1></div></div>
@@ -1370,16 +1399,8 @@ def ds_summary() -> str:
 
 def ds_warn() -> str:
     on = [x for x in ds_items() if x.get("enabled")]
-    chars = sum(x.get("chars", 0) for x in on)
     if not on:
         return '<div class=warn style="background:var(--pri-bg);color:var(--pri)">使用中のマニュアルがないため、既定の方針で校正します。</div>'
-    mode = load_config().get("manual_mode", "auto")
-    if mode != "full" and (mode == "search" or chars > MANUAL_WARN_CHARS):
-        miss = [x["name"] for x in on if not x.get("embedded")]
-        msg = f'{chars:,} 字あるため、区切りごとに関係する項目だけを検索して渡します。'
-        if miss:
-            msg += f' 埋め込みが未計算のもの（{html.escape("、".join(miss))}）は次の校正の開始時に計算します。'
-        return f'<div class=warn style="background:var(--pri-bg);color:var(--pri)">{msg}</div>'
     return ""
 
 
@@ -1391,7 +1412,8 @@ const show = m => m.classList.add('show'), hide = m => m.classList.remove('show'
 $('#q').oninput = filter;
 function filter() { const v = $('#q').value.trim().toLowerCase(); document.querySelectorAll('#rows tr[data-name]').forEach(tr => tr.hidden = v && !tr.dataset.name.includes(v)); }
 async function refresh() {
-  const d = await (await fetch('/api/dataset')).json();
+  let d;
+  try { const r = await fetch('/api/dataset'); if (!r.ok) throw 0; d = await r.json(); } catch (_) { window._poll = setTimeout(refresh, 4000); return; }
   $('#rows').innerHTML = d.rows; $('#stats').innerHTML = d.stats; $('#warn').innerHTML = d.warn; filter();
   poll();
 }
@@ -1408,7 +1430,7 @@ function reset() { flist.innerHTML = ''; upErr.textContent = ''; pick.value = ''
 // 使う／使わない・編集・削除
 document.addEventListener('change', async e => {
   const rl = e.target.closest('[data-rule]');
-  if (rl) { await fetch(`/dataset/${rulesOf}/rule`, {method: 'POST', body: new URLSearchParams({idx: rl.dataset.rule, enabled: rl.checked ? '1' : '0'})});
+  if (rl) { await fetch(`/dataset/${rulesOf}/rule`, {method: 'POST', body: new URLSearchParams({key: rl.dataset.rule, enabled: rl.checked ? '1' : '0'})});
     toast(rl.checked ? 'このルールを使います' : 'このルールを使わないようにしました'); return; }
   const t = e.target.closest('[data-toggle]'); if (!t) return;
   await fetch(`/dataset/${t.dataset.toggle}/toggle`, {method: 'POST', body: new URLSearchParams({enabled: t.checked ? '1' : '0'})});
@@ -1426,7 +1448,7 @@ document.addEventListener('click', async e => {
   if (ru) { rulesOf = ru.dataset.rules; const d = await (await fetch(`/dataset/${rulesOf}/rules`)).json();
     $('#ruName').textContent = d.name;
     $('#ruList').innerHTML = d.rules.length ? '<table class=tbl><thead><tr><th>使用</th><th>種類</th><th>内容</th><th>根拠</th><th>読み取り</th></tr></thead><tbody>' + d.rules.map((r, i) =>
-      `<tr><td><label class=switch><input type=checkbox data-rule="${i}"${r.enabled ? ' checked' : ''}><i></i></label></td><td><span class=tag>${TYPE[r.type] || r.type}</span></td>`
+      `<tr><td><label class=switch><input type=checkbox data-rule="${esc(r.key)}"${r.enabled ? ' checked' : ''}><i></i></label></td><td><span class=tag>${TYPE[r.type] || r.type}</span></td>`
       + `<td><code>${esc(r.from)}</code>${r.to ? ' → <code>' + esc(r.to) + '</code>' : ''}<div class=muted>${esc(r.note || '')}</div></td><td><span class=cite>［${esc(r.cid)}］</span></td><td class=muted>${r.by}</td></tr>`).join('') + '</tbody></table>'
       : '<p class=muted>読み取れたルールはありません。</p>';
     show($('#ruModal')); return; }
@@ -1516,7 +1538,18 @@ def page_dataset() -> str:
     return shell("データセット", "dataset", body, DATASET_JS)
 
 
+FORM_MAX = 64 * 1024            # 設定・実行のフォーム
+FORM_MAX_EDIT = 5 * 1024 * 1024  # マニュアルの編集（本文を送る）
+
+
 class H(BaseHTTPRequestHandler):
+    def _form(self, limit: int) -> dict | None:
+        """フォームを読む。大きすぎれば None（読まずに断る）"""
+        n = int(self.headers.get("Content-Length", "0") or 0)
+        if n > limit:
+            return None
+        return urllib.parse.parse_qs(self.rfile.read(n).decode("utf-8", "replace"), keep_blank_values=True)
+
     def _send(self, body: str, code=200, ctype="text/html; charset=utf-8"):
         b = body.encode()
         self.send_response(code)
@@ -1545,7 +1578,8 @@ class H(BaseHTTPRequestHandler):
             if not item:
                 return self._send("not found", 404)
             if parts[1:] == ["rules"]:
-                return self._send(json.dumps({"name": item["name"], "rules": ds_rules(item["id"])}, ensure_ascii=False), ctype="application/json")
+                rules = [dict(r, key=pr.rule_key(r)) for r in ds_rules(item["id"])]
+                return self._send(json.dumps({"name": item["name"], "rules": rules}, ensure_ascii=False), ctype="application/json")
             if parts[1:] == ["chunks"]:
                 chunks = [{"cid": c["cid"], "text": c["text"], "vec": bool(c.get("vec"))} for c in ds_chunks(item["id"])]
                 return self._send(json.dumps({"name": item["name"], "chunks": chunks}, ensure_ascii=False), ctype="application/json")
@@ -1582,8 +1616,9 @@ class H(BaseHTTPRequestHandler):
             return self._ds_upload(urllib.parse.parse_qs(url.query))
         if url.path.startswith("/dataset/"):
             parts = url.path.split("/")[2:]
-            n = int(self.headers.get("Content-Length", "0"))
-            form = urllib.parse.parse_qs(self.rfile.read(n).decode(), keep_blank_values=True)
+            form = self._form(FORM_MAX_EDIT)
+            if form is None:
+                return self._send("too large", 413)
             if not any(x["id"] == parts[0] for x in ds_items()):
                 return self._send("not found", 404)
             if parts[1:] == ["text"]:
@@ -1593,7 +1628,7 @@ class H(BaseHTTPRequestHandler):
             elif parts[1:] == ["delete"]:
                 ds_delete(parts[0])
             elif parts[1:] == ["rule"]:
-                ds_update(parts[0], rule=int(form.get("idx", ["-1"])[0]), rule_on=form.get("enabled", ["1"])[0] == "1")
+                ds_update(parts[0], rule_key=form.get("key", [""])[0], rule_on=form.get("enabled", ["1"])[0] == "1")
             elif parts[1:] == ["reprocess"]:
                 try:
                     ds_update(parts[0], reprocess=True)
@@ -1603,8 +1638,9 @@ class H(BaseHTTPRequestHandler):
                 return self._send("not found", 404)
             return self._send("ok")
         if self.path == "/settings":
-            n = int(self.headers.get("Content-Length", "0"))
-            form = urllib.parse.parse_qs(self.rfile.read(n).decode(), keep_blank_values=True)
+            form = self._form(FORM_MAX)
+            if form is None:
+                return self._send("too large", 413)
             cfg = load_config()
             for k in DEFAULTS:
                 if k in form:
@@ -1617,8 +1653,9 @@ class H(BaseHTTPRequestHandler):
             return self._send(page_settings(msg))
         if self.path != "/run":
             return self._send("not found", 404)
-        n = int(self.headers.get("Content-Length", "0"))
-        form = urllib.parse.parse_qs(self.rfile.read(n).decode())
+        form = self._form(FORM_MAX)
+        if form is None:
+            return self._send("too large", 413)
         try:
             p = safe(form["path"][0])
         except Exception:
