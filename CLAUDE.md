@@ -1,13 +1,13 @@
 # CLAUDE.md
 
-特許明細書（.docx）をローカル LLM で事務校正する Olares アプリ。UI と校正対象は日本語。
+特許明細書（.docx）をローカル LLM で事務校正する Olares アプリ「Proofy」（チャート名・アプリ名は patentproof のまま。変えると Olares で別アプリ扱いになる）。UI と校正対象は日本語。
 
 ## 構成
 - `patentproof/` — Olares アプリのチャート（`OlaresManifest.yaml`, `Chart.yaml`, `values.yaml`, `templates/`）
 - `patentproof/app/proofread.py` — 校正ロジック（CLI としても動く）
 - `patentproof/app/server.py` — Web UI とジョブキュー（標準ライブラリの http.server、ワーカー1本で直列実行）
 - `templates/deployment.yaml` — python:3.12-slim を使い、起動時に python-docx / pypdf / janome / regex を pip で入れる。アプリのコードは configmap で渡す
-- `icon.png` — アプリアイコン（Manifest からは raw.githubusercontent.com の URL で参照している）
+- `icon.png` — アプリアイコン（512px。Manifest からは raw.githubusercontent.com の URL で参照し、変えたら `?v=` を上げて Olares のキャッシュを避ける）
 
 ## 処理の流れ
 server.py の worker が工程（`STEPS`）を1つずつ実行し、工程ごとの状態・所要時間を画面に出す。CPU の工程を先に済ませ、GPU の工程（OCR → LLM）は重ねない。
@@ -23,6 +23,7 @@ server.py の worker が工程（`STEPS`）を1つずつ実行し、工程ごと
 6. 書き出し `apply_to_docx`: 全回一致の小さな修正は変更履歴、それ以外は【要確認】コメントとして書き込み、CSV も出す
 
 GPU の取り合い対策: OCR・埋め込み・LLM はどれも1本のワーカーが工程の順に呼ぶので、処理が重ならない。OCR の処理が終われば次の工程に進む（PaddleOCR のアプリを止める必要はない）。`proofread.BEFORE_CALL` の `gpu_gate` では中止（/cancel/<id>）を反映する。
+工程ごとの進み具合は `proofread.PROGRESS(済んだ数, 全体)` で知らせ、`step` が % にする（LLM の呼び出し数、OCR のページ数、段落数、埋め込みの数）。全体の % は `STEP_WEIGHT` の重みで見積もる。
 LLM の呼び出しごとの秒数・トークン数・finish_reason は `LLM.stats` に記録し、ログに `LLM.summary()` を出す（ボトルネックの確認用）。
 
 校正方針は `DEFAULT_MANUAL`。「データセット」画面で使用オンのマニュアルがあればそれを使い、`_sys_view` と `sys_verify()` の両方に入る。旧版の設定画面の校正方針は初回にデータセットへ移す。`PROOF_MANUAL_FILE` でも差し替えられる。

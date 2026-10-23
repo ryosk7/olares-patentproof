@@ -608,7 +608,8 @@ def repeat_checks(paras: list[Para]) -> list[Finding]:
         log("形態素解析（janome）が使えないため、語の重複チェックは同じ文の繰り返しだけ行います")
         return out
     tk = Tokenizer()
-    for p in paras:
+    for pi, p in enumerate(paras, 1):
+        progress(pi, len(paras))
         toks = morph_tokens(p.text, tk)
         i = 0
         while i < len(toks):
@@ -720,10 +721,34 @@ def ocr_pages(data: bytes, file_type: int) -> list[str]:
     raise RuntimeError(f"OCR に接続できません（{OCR_URL}: {last}）")
 
 
+OCR_PAGES = 4  # PDF を OCR に送るときの1回あたりのページ数（GPU のメモリを一度に使いすぎない。進み具合も出せる）
+
+
+def ocr_pdf_pages(data: bytes) -> list[str]:
+    """PDF を OCR_PAGES ページずつに分けて OCR で読み、ページごとの文字列を返す"""
+    import io
+    try:
+        from pypdf import PdfReader, PdfWriter
+        reader = PdfReader(io.BytesIO(data))
+        n = len(reader.pages)
+    except Exception:
+        return ocr_pages(data, 0)  # 分けられない PDF はそのまま送る
+    pages: list[str] = []
+    for k in range(0, n, OCR_PAGES):
+        w = PdfWriter()
+        for i in range(k, min(n, k + OCR_PAGES)):
+            w.add_page(reader.pages[i])
+        buf = io.BytesIO()
+        w.write(buf)
+        pages += ocr_pages(buf.getvalue(), 0)
+        progress(min(n, k + OCR_PAGES), n)
+    return pages
+
+
 def ocr_pdf_text(pdf_path) -> str | None:
     """図面PDFの全ページの文字を OCR で読む。使えなければ None。"""
     try:
-        pages = ocr_pages(open(pdf_path, "rb").read(), 0)
+        pages = ocr_pdf_pages(open(pdf_path, "rb").read())
     except Exception as e:
         log(f"図面PDF: {e}")
         return None
@@ -786,8 +811,15 @@ def drawing_symbol_checks(paras: list[Para], pdf_path, allow_ocr: bool = True, t
 # ---------------------------------------------------------------------------
 # 3. LLM
 # ---------------------------------------------------------------------------
-# LLM を呼ぶ直前に呼ばれる関数（アプリが「PaddleOCR が止まるまで待つ」「キャンセル」に使う）
+# LLM を呼ぶ直前に呼ばれる関数（アプリが中止の反映に使う）
 BEFORE_CALL = None
+# 工程の進み具合を知らせる関数 (済んだ数, 全体の数)。アプリが工程ごとの % の表示に使う
+PROGRESS = None
+
+
+def progress(done: int, total: int):
+    if PROGRESS and total:
+        PROGRESS(done, total)
 
 
 class LLM:
@@ -1018,6 +1050,7 @@ def llm_vote(llm: LLM, paras: list[Para], seg_chars: int):
         run, title, system, user, source = t
         out = rows_to_findings(parse_lines(llm.chat(system, user, temperature=SAMPLE_TEMP, top_p=0.95)), source)
         done[0] += 1
+        progress(done[0], len(tasks))
         log(f"LLM: {done[0]}/{len(tasks)} {run + 1}回目 {title} … {len(out)}件")
         for f in out:
             f.run = run
@@ -1071,8 +1104,9 @@ def llm_verify(llm: LLM, single: dict[int, list[Finding]], gtext: list[str]) -> 
 
     out: list[Finding] = []
     with ThreadPoolExecutor(PARALLEL) as ex:
-        for got in ex.map(verify_group, sorted(single.items())):
+        for k, got in enumerate(ex.map(verify_group, sorted(single.items())), 1):
             out += got
+            progress(k, len(single))
     log(f"LLM: 1票の候補 {sum(len(v) for v in single.values())} 件のうち {len(out)} 件を検証で採用")
     return out
 

@@ -1,4 +1,4 @@
-# Patent Proofreader (patentproof) for Olares
+# Proofy (patentproof) for Olares
 
 An Olares app that proofreads Japanese patent specifications (.docx) with a local LLM running on your Olares.
 Documents never leave your Olares.
@@ -39,7 +39,7 @@ A model of 27B or larger with good Japanese ability is recommended.
    - **OCR URL** (optional): Settings → Applications → PaddleOCR → Shared entrance
    - Click 「保存して接続確認」 (Save and check); you are ready when both show 「接続できます」 (connected)
 
-Install-time defaults can also be changed through Olares environment variables (Settings → Applications → Patent Proofreader → Environment variables).
+Install-time defaults can also be changed through Olares environment variables (Settings → Applications → Proofy → Environment variables).
 Values saved on the app's Settings page take precedence.
 
 ## Usage

@@ -1,4 +1,4 @@
-"""特許明細書 AI校正 — Olares アプリ用の小さな Web サーバー（標準ライブラリのみ）
+"""Proofy（特許明細書の AI 校正）— Olares アプリ用の小さな Web サーバー（標準ライブラリのみ）
 
 - /data 以下（Home/Documents をマウント）の .docx を一覧表示し、ボタンで校正を開始
 - 画面は左のサイドバー（明細書／実行履歴／設定）と本文。一覧の状態は /api/rows を数秒ごとに読んで差し替える
@@ -194,7 +194,7 @@ def embed_model(cfg: dict, models: list[str] | None = None) -> str:
     return next((m for m in models if "gemma" in m.lower()), models[0] if models else "")
 
 
-def embed(texts: list[str], cfg: dict) -> list[list[float]]:
+def embed(texts: list[str], cfg: dict, on_progress=None) -> list[list[float]]:
     import urllib.request
     model = embed_model(cfg)
     if not model:
@@ -209,6 +209,8 @@ def embed(texts: list[str], cfg: dict) -> list[list[float]]:
         with urllib.request.urlopen(req, timeout=300) as r:
             data = json.loads(r.read())["data"]
         out += [d["embedding"] for d in sorted(data, key=lambda d: d.get("index", 0))]
+        if on_progress:
+            on_progress(len(out), len(texts))
     return out
 
 
@@ -532,13 +534,20 @@ class step:
         if self.job.get("cancel"):
             raise Cancelled()
         self.st = self.job["steps"][self.key]
-        self.st.update(status="実行中", started=time.time())
+        self.st.update(status="実行中", started=time.time(), pct=0)
         self.job["current"] = self.key
+        pr.PROGRESS = self.set  # 工程の中の処理（LLM の呼び出し・OCR・段落ごとの処理など）が進み具合を知らせる
         return self.st
 
+    def set(self, done: int, total: int):
+        self.st["pct"] = min(99, int(done * 100 / total)) if total else 0
+
     def __exit__(self, et, ev, tb):
+        pr.PROGRESS = None
         self.st["secs"] = time.time() - self.st["started"]
         self.st["status"] = "完了" if et is None else "キャンセル" if et is Cancelled else "エラー"
+        if et is None:
+            self.st["pct"] = 100
         gc.collect()  # 工程ごとにメモリを返し、次の工程（LLM の並列呼び出しなど）と取り合わないようにする
         return False
 
@@ -702,7 +711,7 @@ def prepare_manual(job: dict, cfg: dict, paras, seg_chars: int):
             filled = ds_fill_vectors(cfg)
             chunks = ds_active_chunks()
             groups = pr.segments(paras, seg_chars)
-            qv = embed(["\n".join(p.text for p in g) for g in groups], cfg)
+            qv = embed(["\n".join(p.text for p in g) for g in groups], cfg, on_progress=pr.PROGRESS)
             order_of = {c["cid"]: i for i, c in enumerate(chunks)}
             picks = []
             for v in qv:
@@ -868,8 +877,7 @@ body{margin:0;background:var(--bg);color:var(--text);font:14px/1.6 -apple-system
 a{color:var(--pri);text-decoration:none}a:hover{text-decoration:underline}
 .app{display:flex;min-height:100vh}
 .side{width:220px;flex:none;background:var(--panel);border-right:1px solid var(--line);padding:20px 12px;display:flex;flex-direction:column;gap:4px;position:sticky;top:0;height:100vh}
-.brand{display:flex;align-items:center;gap:10px;padding:0 8px 18px;font-weight:700;font-size:15px}
-.logo{width:30px;height:30px;border-radius:8px;background:var(--pri);color:#fff;display:grid;place-items:center;font-size:15px}
+.brand{padding:2px 12px 18px;font-weight:800;font-size:20px;letter-spacing:-.01em;color:var(--pri)}
 .nav{display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:8px;color:var(--text)}
 .nav:hover{background:var(--bg);text-decoration:none}.nav.on{background:var(--pri-bg);color:var(--pri);font-weight:600}
 .nav svg{width:18px;height:18px;flex:none}
@@ -942,7 +950,9 @@ pre{margin:0;white-space:pre-wrap;font-size:12px;background:#1f2329;color:#d7dae
 .stp .dot{position:relative;z-index:1;width:28px;height:28px;margin:0 auto 6px;border-radius:50%;display:grid;place-items:center;background:var(--wait-bg);color:var(--sub);font-weight:700;font-size:13px}
 .stp.done .dot{background:var(--pri);color:#fff}.stp.run .dot{background:var(--run);color:#fff;animation:blink 1.2s infinite}
 .stp.ng .dot{background:var(--ng);color:#fff}.stp.skip .dot{background:var(--bg);color:var(--faint)}
-.stp b{display:block;color:var(--text);font-size:13px}.stp .res{font-size:11px;color:var(--faint)}
+.stp b{display:block;color:var(--text);font-size:13px}
+.stp .pct{font-size:15px;font-weight:700;color:var(--run);margin-top:2px}
+.pbar{height:4px;background:var(--bg);border-radius:4px;margin:4px 10px 0;overflow:hidden}.pbar i{display:block;height:100%;background:var(--run);transition:width .4s}.stp .res{font-size:11px;color:var(--faint)}
 .stp .sn{font-size:11px;color:var(--sub);margin-top:2px;word-break:break-all}
 .switch{position:relative;width:36px;height:20px;flex:none;display:inline-block}.switch input{display:none}
 .switch i{position:absolute;inset:0;border-radius:999px;background:#c9cdd4;transition:.15s;cursor:pointer}
@@ -957,7 +967,7 @@ details.def summary{cursor:pointer;color:var(--sub);font-size:13px}details.def p
 .toast.show{opacity:1}
 @media (max-width:760px){
  .app{flex-direction:column}.side{width:auto;height:auto;position:static;flex-direction:row;align-items:center;padding:10px 12px;border-right:0;border-bottom:1px solid var(--line);overflow-x:auto}
- .brand{padding:0 8px 0 0}.brand span,.side .foot{display:none}.main{width:100%;padding:18px 16px 40px}
+ .brand{padding:0 10px 0 2px;font-size:17px}.side .foot{display:none}.nav{white-space:nowrap;flex:none}.main{width:100%;padding:18px 16px 40px}
  .stats{grid-template-columns:repeat(3,1fr);gap:8px}.stat{padding:10px 12px}.stat .v{font-size:18px}.bar .muted{display:none}
  .tbl .hide-sm{display:none}.steps{grid-template-columns:repeat(3,1fr);row-gap:16px}.stp:nth-child(3n+1)::before{display:none}.tbl td,.tbl th{padding:10px 12px}.form{grid-template-columns:1fr}.form label{padding-top:0}
 }
@@ -982,8 +992,8 @@ def shell(title: str, active: str, body: str, script: str = "", busy: bool = Fal
     nav = "".join(f'<a class="nav{" on" if key == active else ""}" href="{href}">{ICONS[icon]}<span>{label}</span></a>'
                   for key, href, icon, label in (("docs", "/", "doc", "明細書"), ("dataset", "/dataset", "db", "データセット"), ("jobs", "/jobs", "hist", "実行履歴"), ("settings", "/settings", "gear", "設定")))
     return f"""<!doctype html><html lang=ja><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
-<title>{html.escape(title)} - 明細書 AI校正</title><style>{CSS}</style>
-<body data-busy={int(busy)}><div class=app><aside class=side><div class=brand><div class=logo>校</div><span>明細書 AI校正</span></div>{nav}
+<title>{html.escape(title)} - Proofy</title><style>{CSS}</style>
+<body data-busy={int(busy)}><div class=app><aside class=side><div class=brand>Proofy</div>{nav}
 <div class=foot>LLM<br>{html.escape(load_config()["llm_model"])}</div></aside>
 <main class=main id=main>{body}</main></div><div class=toast id=toast></div>{script}</body></html>"""
 
@@ -1020,6 +1030,18 @@ def latest_jobs() -> dict[str, str]:
     return out
 
 
+# 全体の % を見積もるときの工程ごとの重み（2万字級のフル校正での所要時間のおおよその割合）。スキップした工程は数えない
+STEP_WEIGHT = {"extract": 1, "rules": 3, "drawing": 8, "retrieve": 3, "vote": 75, "verify": 8, "write": 2}
+
+
+def overall_pct(j: dict) -> int:
+    steps = j.get("steps") or {}
+    use = {k: w for k, w in STEP_WEIGHT.items() if steps.get(k, {}).get("status") != "スキップ"}
+    total = sum(use.values()) or 1
+    done = sum(w * (100 if steps.get(k, {}).get("status") == "完了" else steps.get(k, {}).get("pct", 0)) for k, w in use.items())
+    return min(100, int(done / total))
+
+
 def job_tag(jid: str, show_mode: bool = True) -> str:
     j = jobs[jid]
     st = j["status"]
@@ -1029,7 +1051,9 @@ def job_tag(jid: str, show_mode: bool = True) -> str:
         label = f"待機中（{ahead}件待ち）" if ahead else st
     elif st == "実行中" and j.get("started"):
         cur = STEP_NAME.get(j.get("current") or "")
-        label = f"{cur[0]}/{len(STEPS)} {cur[1]} ・ {fmt_dur(time.time() - j['started'])}" if cur else f"実行中 {fmt_dur(time.time() - j['started'])}"
+        pct = (j.get("steps") or {}).get(j.get("current") or "", {}).get("pct", 0)
+        label = (f"{cur[0]}/{len(STEPS)} {cur[1]} {pct}% ・ 全体 {overall_pct(j)}% ・ {fmt_dur(time.time() - j['started'])}"
+                 if cur else f"実行中 {fmt_dur(time.time() - j['started'])}")
     mode = "ルールのみ" if show_mode and j.get("mode") == "rules" else ""
     return f'<span class="tag {STATUS_TAG[st]}">{html.escape(label)}</span>' + (f' <span class=muted>{mode}</span>' if mode else "")
 
@@ -1315,8 +1339,10 @@ def page_job(jid: str) -> str:
     steps = j.get("steps") or {}
     stepper = "".join(
         f'<div class="stp {cls.get(steps.get(k, {}).get("status"), "")}"><div class=dot>{"✓" if steps.get(k, {}).get("status") == "完了" else i}</div>'
-        f'<b>{name}</b><div class=res>{res}{" ・ " + fmt_dur(steps[k]["secs"]) if steps.get(k, {}).get("secs") is not None else ""}</div>'
-        f'<div class=sn>{html.escape(steps.get(k, {}).get("note", "") if steps.get(k, {}).get("status") != "待機" else "")}</div></div>'
+        f'<b>{name}</b><div class=res>{fmt_dur(steps[k]["secs"]) if steps.get(k, {}).get("secs") is not None else "&nbsp;"}</div>'
+        + (f'<div class=pct>{steps[k].get("pct", 0)}%</div><div class=pbar><i style="width:{steps[k].get("pct", 0)}%"></i></div>'
+           if steps.get(k, {}).get("status") == "実行中" else "")
+        + f'<div class=sn>{html.escape(steps.get(k, {}).get("note", "") if steps.get(k, {}).get("status") != "待機" else "")}</div></div>'
         for i, (k, name, res) in enumerate(STEPS, 1))
     trows = j.get("table") or []
     ttable = ""
