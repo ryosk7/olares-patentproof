@@ -4,7 +4,7 @@
 - 画面は左のサイドバー（明細書／実行履歴／設定）と本文。一覧の状態は /api/rows を数秒ごとに読んで差し替える
 - 画面からファイルを選ぶかドラッグ＆ドロップすると Documents/アップロード/<明細書名>/ に保存する
 - 校正は1件ずつ、工程（STEPS）を順番に実行する。CPU の工程（抽出・機械チェック）→ GPU の工程（OCR → LLM）の順で、
-  OCR（PaddleOCR）と LLM は同時に動かさない（LLM を呼ぶ前に PaddleOCR が止まっていることを確かめ、動いていれば待つ）
+  OCR（PaddleOCR）と LLM の処理は重ならない（OCR が終わってから次の工程に進む）
 - 結果は元ファイルと同じフォルダに【AI校正】〜.docx、〜_修正箇所一覧.csv、〜_符号対応表.csv として保存
 - 校正マニュアルは「データセット」（APP_DATA/dataset）で管理し、有効なものをつなげて校正方針にする
 """
@@ -13,6 +13,7 @@ from __future__ import annotations
 import gc
 import html
 import json
+import re
 import os
 import queue
 import sys
@@ -42,6 +43,10 @@ DEFAULTS = {
     "parallel": os.environ.get("PROOF_LLM_PARALLEL", "2"),
     "ocr_url": os.environ.get("PROOF_OCR_URL", pr.OCR_URL),
     "whole_views": os.environ.get("PROOF_WHOLE_VIEWS", "0"),
+    "manual_mode": "auto",  # auto: 8000字までは全文、超えたら検索 / full: 常に全文 / search: 常に検索
+    "embed_model": os.environ.get("PROOF_EMBED_MODEL", ""),  # 空なら LLM の URL のモデル一覧から自動で選ぶ
+    "top_k": "6",
+    "rule_llm": "1",  # マニュアルからのルール読み取りに LLM も使うか
     "manual": "",  # 旧版の設定画面の校正方針。データセットへ移したあとは空
 }
 
@@ -81,11 +86,20 @@ def apply_config(cfg: dict):
     pr.MANUAL = ds_manual() or (cfg.get("manual") or "").strip() or pr._load_manual()
 
 
-# ---- データセット（校正マニュアル）。index.json に一覧、<id>.txt に本文を置く ----
+# ---- データセット（校正マニュアル） ----
+# APP_DATA/dataset/
+#   index.json          一覧（id, code=M1 などの項目番号の頭, name, enabled, chars, chunks, embedded, images, images_unread …）
+#   <id>.txt            取り出した本文（画像の OCR 結果を含む）
+#   <id>.chunks.json    チャンク [{cid: "M1-3", text, vec}]（vec は埋め込み。未計算なら null）
+#   <id>.orig.<拡張子>   取り込んだ元ファイル（画像の読み直し用）
 DATASET_CANDIDATES = [APP_DATA / "dataset", ROOT / ".patentproof" / "dataset"]
-DATASET_EXTS = (".txt", ".md", ".docx", ".pdf")
-MANUAL_WARN_CHARS = 8000  # これを超えると LLM の1回ごとの入力が長くなり、校正が遅くなる
-ds_lock = threading.Lock()
+DATASET_EXTS = (".txt", ".md", ".docx", ".pdf", ".png", ".jpg", ".jpeg")
+MANUAL_WARN_CHARS = 8000  # これを超えると全文では渡さず、検索で関係する項目だけを渡す（「自動」のとき）
+CHUNK_CHARS = 400
+OCR_PAGES = 4           # スキャン PDF を OCR に送るときの1回あたりのページ数
+EMBED_BATCH = 8         # 埋め込みを1回に送るチャンク数
+OCR_IMAGE_MAX = 10 * 1024 * 1024  # これより大きい画像は OCR に送らない
+ds_lock = threading.RLock()  # 旧設定の移行で ds_items → ds_put と入れ子になるため
 
 
 def ds_dir() -> Path:
@@ -106,22 +120,22 @@ def ds_items() -> list[dict]:
     idx = d / "index.json"
     if not idx.exists():
         items: list[dict] = []
+        idx.write_text("[]", encoding="utf-8")
         # 旧版で設定画面に書いた校正方針をデータセットへ移す
         cfg = load_config()
         if (cfg.get("manual") or "").strip():
-            items.append(_ds_write(d, "設定画面の校正方針.txt", cfg["manual"].strip(), "設定画面から移行"))
+            ds_put("設定画面の校正方針.txt", cfg["manual"].strip().encode("utf-8"), "設定画面から移行")
             cfg["manual"] = ""
             save_config(cfg)
-        idx.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+            items = json.loads(idx.read_text(encoding="utf-8"))
         return items
-    return json.loads(idx.read_text(encoding="utf-8"))
-
-
-def _ds_write(d: Path, name: str, text: str, source: str, item: dict | None = None) -> dict:
-    item = item or {"id": f"{int(time.time() * 1000):x}", "name": name, "enabled": True}
-    (d / f"{item['id']}.txt").write_text(text, encoding="utf-8")
-    item.update({"chars": len(text), "updated": time.time(), "source": source})
-    return item
+    items = json.loads(idx.read_text(encoding="utf-8"))
+    n = max([int(x["code"][1:]) for x in items if x.get("code")] or [0])
+    for x in items:  # 項目番号の頭（M1, M2 …）がない旧データに振る
+        if not x.get("code"):
+            n += 1
+            x["code"] = f"M{n}"
+    return items
 
 
 def ds_save(items: list[dict]):
@@ -132,74 +146,269 @@ def ds_text(item_id: str) -> str:
     return (ds_dir() / f"{item_id}.txt").read_text(encoding="utf-8")
 
 
-def ds_put(name: str, text: str, source: str) -> tuple[dict, bool]:
-    """同じ名前があれば本文を差し替える（更新）。なければ追加する。戻り値: (項目, 更新したか)"""
+def ds_chunks(item_id: str) -> list[dict]:
+    f = ds_dir() / f"{item_id}.chunks.json"
+    return json.loads(f.read_text(encoding="utf-8")) if f.exists() else []
+
+
+def _orig(item: dict) -> Path:
+    return ds_dir() / f"{item['id']}.orig{Path(item['name']).suffix.lower()}"
+
+
+HEAD_RE = re.compile(r"^(#{1,6}\s|第[0-9０-９一二三四五六七八九十百]+[章節条項]|[0-9０-９]+[.．、)）]|[（(][0-9０-９]+[)）]|[■□◆◇●○▼▲【])")
+
+
+def chunk_text(text: str) -> list[str]:
+    """マニュアルを項目（見出し・箇条書き）の切れ目で CHUNK_CHARS 字前後にまとめる。見出しは次のチャンクの頭に付ける"""
+    chunks, cur, heads, head = [], [], 0, ""
+    for line in (l.strip() for l in text.splitlines()):
+        if not line:
+            continue
+        is_head = bool(HEAD_RE.match(line)) and len(line) <= 60
+        size = sum(len(x) for x in cur)
+        # 見出しだけのチャンクは作らない（見出しが続くときは次の本文とまとめる）
+        if cur and len(cur) > heads and (is_head or size + len(line) > CHUNK_CHARS):
+            chunks.append("\n".join(cur))
+            cur, heads = ([head], 1) if head and not is_head else ([], 0)  # 続きのチャンクにも見出しを付ける
+        if is_head:
+            head = line
+            heads += 1
+        cur.append(line)
+    if cur:
+        chunks.append("\n".join(cur))
+    return [c for c in chunks if c.strip()]
+
+
+def embed_model(cfg: dict, models: list[str] | None = None) -> str:
+    """埋め込みモデル。設定が空なら LLM の URL のモデル一覧から小さい埋め込みモデル（gemma 系を優先）を選ぶ"""
+    if cfg.get("embed_model"):
+        return cfg["embed_model"]
+    models = [m for m in (list_models(cfg) if models is None else models) if "embed" in m.lower()]
+    return next((m for m in models if "gemma" in m.lower()), models[0] if models else "")
+
+
+def embed(texts: list[str], cfg: dict) -> list[list[float]]:
+    import urllib.request
+    model = embed_model(cfg)
+    if not model:
+        raise RuntimeError("埋め込みモデルが見つかりません")
+    out: list[list[float]] = []
+    headers = {"Content-Type": "application/json"}
+    if cfg.get("llm_api_key"):
+        headers["Authorization"] = "Bearer " + cfg["llm_api_key"]
+    for i in range(0, len(texts), EMBED_BATCH):
+        body = json.dumps({"model": model, "input": texts[i:i + EMBED_BATCH]}).encode()
+        req = urllib.request.Request(cfg["llm_base_url"].rstrip("/") + "/embeddings", data=body, headers=headers)
+        with urllib.request.urlopen(req, timeout=300) as r:
+            data = json.loads(r.read())["data"]
+        out += [d["embedding"] for d in sorted(data, key=lambda d: d.get("index", 0))]
+    return out
+
+
+def extract_text(name: str, data: bytes, ocr: bool) -> tuple[str, int, int]:
+    """マニュアルのファイルから本文を取り出す。ocr=True なら画像（docx 内の画像・文字のない PDF ページ・画像ファイル）を OCR で読む。
+    戻り値: (本文, 画像の数, 読めなかった画像の数)"""
+    import io
+    ext = Path(name).suffix.lower()
+    if ext in (".txt", ".md"):
+        for enc in ("utf-8-sig", "cp932", "euc-jp"):
+            try:
+                return data.decode(enc).replace("\r\n", "\n").strip(), 0, 0
+            except UnicodeDecodeError:
+                continue
+        raise ValueError("文字コードを判別できません（UTF-8 か Shift_JIS で保存してください）")
+    if ext in (".png", ".jpg", ".jpeg"):
+        if not ocr:
+            return "", 1, 1
+        return "\n".join(pr.ocr_pages(data, 1)).strip(), 1, 0
+    if ext == ".docx":
+        from docx import Document
+        from docx.oxml.ns import qn
+        d = Document(io.BytesIO(data))
+        lines, images, unread = [], 0, 0
+        for p in d.paragraphs:
+            lines.append(p.text)
+            for blip in p._p.iter(qn("a:blip")):
+                part = d.part.related_parts.get(blip.get(qn("r:embed")))
+                if part is None:
+                    continue
+                images += 1
+                if not ocr or len(part.blob) > OCR_IMAGE_MAX:
+                    unread += 1
+                    continue
+                try:
+                    got = "\n".join(pr.ocr_pages(part.blob, 1)).strip()
+                    if got:
+                        lines.append(f"［図の文字］\n{got}")
+                except Exception:
+                    unread += 1
+        for t in d.tables:
+            for row in t.rows:
+                lines.append("｜".join(c.text.strip() for c in row.cells))
+        return "\n".join(lines).strip(), images, unread
+    if ext == ".pdf":
+        from pypdf import PdfReader
+        try:
+            pages = [(pg.extract_text() or "").strip() for pg in PdfReader(io.BytesIO(data)).pages]
+        except Exception as e:
+            raise ValueError(f"PDF を読めませんでした（壊れているか、パスワード付きの可能性: {e}）")
+        blank = [i for i, t in enumerate(pages) if len(t) < 20]  # 文字のないページ（スキャン・画像）
+        if blank and ocr:
+            # 文字のないページだけを OCR_PAGES ページずつ別の PDF にして送る（GPU のメモリを一度に使いすぎない）
+            from pypdf import PdfWriter
+            reader = PdfReader(io.BytesIO(data))
+            for k in range(0, len(blank), OCR_PAGES):
+                part = blank[k:k + OCR_PAGES]
+                w = PdfWriter()
+                for i in part:
+                    w.add_page(reader.pages[i])
+                buf = io.BytesIO()
+                w.write(buf)
+                for i, t in zip(part, pr.ocr_pages(buf.getvalue(), 0)):
+                    pages[i] = t.strip()
+                del w, buf
+                gc.collect()
+            return "\n".join(pages).strip(), len(blank), 0
+        return "\n".join(pages).strip(), len(blank), len(blank)
+    raise ValueError("対応していない形式です（.txt / .md / .docx / .pdf / .png / .jpg）")
+
+
+def ds_rules(item_id: str) -> list[dict]:
+    f = ds_dir() / f"{item_id}.rules.json"
+    return json.loads(f.read_text(encoding="utf-8")) if f.exists() else []
+
+
+def _write_chunks_rules(item: dict, text: str, llm_rules: list[dict] | None = None):
+    """本文 → チャンク分割 → 書式からのルール読み取り（すべて CPU）。LLM で読み取ったルールは渡されたものを足す"""
+    d = ds_dir()
+    (d / f"{item['id']}.txt").write_text(text, encoding="utf-8")
+    chunks = [{"cid": f"{item['code']}-{i}", "text": c, "vec": None} for i, c in enumerate(chunk_text(text), 1)]
+    old = {r["type"] + r["from"] + r["to"]: r.get("enabled", True) for r in ds_rules(item["id"])}
+    rules = pr.dedupe_rules(pr.parse_manual_rules(chunks) + (llm_rules or []))
+    for r in rules:  # 画面で切ったルールは、読み直しても切ったままにする
+        r["enabled"] = old.get(r["type"] + r["from"] + r["to"], True)
+    (d / f"{item['id']}.chunks.json").write_text(json.dumps(chunks, ensure_ascii=False), encoding="utf-8")
+    (d / f"{item['id']}.rules.json").write_text(json.dumps(rules, ensure_ascii=False, indent=1), encoding="utf-8")
+    item.update(chars=len(text), chunks=len(chunks), rules=len(rules), rules_llm=sum(1 for r in rules if r["by"] == "LLM"),
+                embedded=False, updated=time.time())
+    return chunks
+
+
+def ds_ingest(item: dict, text: str | None = None) -> dict:
+    """取り込みのうち CPU の処理だけをすぐに行う（文字の取り出し・チャンク分割・書式からのルール読み取り）。
+    画像の OCR・埋め込み・LLM でのルール読み取り（GPU）は ds_task としてワーカーに回し、校正と同時に GPU を使わない"""
+    if text is None:
+        text, item["images"], item["images_unread"] = extract_text(item["name"], _orig(item).read_bytes(), ocr=False)
+    _write_chunks_rules(item, text)
+    item["note"] = ""
+    item["task"] = "処理待ち"
+    item["llm_done"] = False
+    return item
+
+
+def ds_enqueue(item_id: str):
+    q.put(("ds", item_id))
+
+
+def ds_put(name: str, data: bytes, source: str) -> tuple[dict, bool]:
+    """同じ名前があれば内容を差し替える（更新）。なければ追加する。戻り値: (項目, 更新したか)"""
     with ds_lock:
         items = ds_items()
         cur = next((x for x in items if x["name"] == name), None)
-        item = _ds_write(ds_dir(), name, text, source, cur)
-        if not cur:
+        if cur:
+            item = cur
+        else:
+            n = max([int(x["code"][1:]) for x in items] or [0]) + 1
+            item = {"id": f"{int(time.time() * 1000):x}", "code": f"M{n}", "name": name, "enabled": True}
             items.append(item)
+        item["source"] = source
+        _orig(item).write_bytes(data)
+        try:
+            ds_ingest(item)
+        except Exception:
+            if not cur:
+                _orig(item).unlink(missing_ok=True)
+            raise
         ds_save(items)
-        return item, bool(cur)
+    ds_enqueue(item["id"])
+    return item, bool(cur)
 
 
 def ds_update(item_id: str, **kw):
     with ds_lock:
         items = ds_items()
         item = next(x for x in items if x["id"] == item_id)
+        queue_it = False
         if "text" in kw:
-            _ds_write(ds_dir(), item["name"], kw["text"], "画面で編集", item)
+            item["source"] = "画面で編集"
+            ds_ingest(item, kw["text"])
+            queue_it = True
+        if kw.get("reprocess"):
+            if item.get("source") == "画面で編集" or not _orig(item).exists():
+                ds_ingest(item, ds_text(item_id))  # 編集した本文はそのまま、チャンク・ルール・埋め込みをやり直す
+            else:
+                ds_ingest(item)
+            queue_it = True
         if "enabled" in kw:
             item["enabled"] = kw["enabled"]
+        if "rule" in kw:  # ルール1件の使用オン／オフ
+            rules = ds_rules(item_id)
+            if 0 <= kw["rule"] < len(rules):
+                rules[kw["rule"]]["enabled"] = kw["rule_on"]
+                (ds_dir() / f"{item_id}.rules.json").write_text(json.dumps(rules, ensure_ascii=False, indent=1), encoding="utf-8")
         ds_save(items)
+    if queue_it:
+        ds_enqueue(item_id)
 
 
 def ds_delete(item_id: str):
     with ds_lock:
-        items = [x for x in ds_items() if x["id"] != item_id]
-        (ds_dir() / f"{item_id}.txt").unlink(missing_ok=True)
-        ds_save(items)
+        items = ds_items()
+        item = next((x for x in items if x["id"] == item_id), None)
+        if item:
+            for f in (ds_dir() / f"{item_id}.txt", ds_dir() / f"{item_id}.chunks.json", ds_dir() / f"{item_id}.rules.json", _orig(item)):
+                f.unlink(missing_ok=True)
+        ds_save([x for x in items if x["id"] != item_id])
+
+
+def ds_active_chunks() -> list[dict]:
+    """使用オンのマニュアルのチャンク（name を付けて返す）"""
+    out = []
+    for x in ds_items():
+        if x.get("enabled"):
+            chunks = ds_chunks(x["id"])
+            if not chunks and (ds_dir() / f"{x['id']}.txt").exists():  # チャンク分割より前の版で取り込んだもの
+                chunks = [{"cid": f"{x['code']}-{i}", "text": c, "vec": None} for i, c in enumerate(chunk_text(ds_text(x["id"])), 1)]
+            out += [dict(c, name=x["name"]) for c in chunks]
+    return out
+
+
+def ds_active_rules() -> list[dict]:
+    """使用オンのマニュアルの、使用オンのルール"""
+    out = []
+    for x in ds_items():
+        if x.get("enabled"):
+            out += [r for r in ds_rules(x["id"]) if r.get("enabled", True)]
+    return out
+
+
+def numbered(chunks: list[dict]) -> str:
+    """チャンクに項目番号を付けて校正方針の文にする（LLM が根拠として番号を書けるように）"""
+    return "\n".join(f"［{c['cid']}］ {c['text']}" for c in chunks)
 
 
 def ds_manual() -> str:
-    """有効なマニュアルをつなげた校正方針（なければ空）"""
+    """使用オンのマニュアル全文（項目番号つき）。なければ空"""
     try:
-        parts = [(x["name"], ds_text(x["id"]).strip()) for x in ds_items() if x.get("enabled")]
+        return numbered(ds_active_chunks())
     except Exception:
         return ""
-    parts = [(n, t) for n, t in parts if t]
-    if len(parts) == 1:
-        return parts[0][1]
-    return "\n\n".join(f"### {n}\n{t}" for n, t in parts)
 
 
-def extract_text(name: str, data: bytes) -> str:
-    """マニュアルのファイルから本文を取り出す（.txt / .md / .docx / .pdf）"""
-    import io
-    ext = Path(name).suffix.lower()
-    if ext in (".txt", ".md"):
-        for enc in ("utf-8-sig", "cp932", "euc-jp"):
-            try:
-                return data.decode(enc).replace("\r\n", "\n").strip()
-            except UnicodeDecodeError:
-                continue
-        raise ValueError("文字コードを判別できません（UTF-8 か Shift_JIS で保存してください）")
-    if ext == ".docx":
-        from docx import Document
-        d = Document(io.BytesIO(data))
-        lines = [p.text for p in d.paragraphs]
-        for t in d.tables:
-            for row in t.rows:
-                lines.append("｜".join(c.text.strip() for c in row.cells))
-        return "\n".join(lines).strip()
-    if ext == ".pdf":
-        from pypdf import PdfReader
-        try:
-            return "\n".join((pg.extract_text() or "") for pg in PdfReader(io.BytesIO(data)).pages).strip()
-        except Exception as e:
-            raise ValueError(f"PDF を読めませんでした（壊れているか、パスワード付きの可能性: {e}）")
-    raise ValueError("対応していない形式です（.txt / .md / .docx / .pdf）")
+def _cos(a: list[float], b: list[float]) -> float:
+    import math
+    na, nb = math.sqrt(sum(x * x for x in a)), math.sqrt(sum(x * x for x in b))
+    return sum(x * y for x, y in zip(a, b)) / (na * nb) if na and nb else 0.0
 
 
 def http_json(url: str, timeout=10, api_key: str = ""):
@@ -276,7 +485,8 @@ def list_docx() -> list[Path]:
 
 
 STEPS = [("extract", "本文の抽出", "CPU"), ("rules", "機械チェック", "CPU"), ("drawing", "図面の照合", "GPU"),
-         ("vote", "LLM 観点チェック", "GPU"), ("verify", "LLM 検証", "GPU"), ("write", "書き出し", "CPU")]
+         ("retrieve", "マニュアルの検索", "GPU"), ("vote", "LLM 観点チェック", "GPU"), ("verify", "LLM 検証", "GPU"),
+         ("write", "書き出し", "CPU")]
 
 
 class Cancelled(Exception):
@@ -284,7 +494,6 @@ class Cancelled(Exception):
 
 
 _ocr_state = {"t": 0.0, "up": False}
-gpu_lock = threading.Lock()
 
 
 def ocr_running(force: bool = False) -> bool:
@@ -303,23 +512,11 @@ def ocr_running(force: bool = False) -> bool:
 
 
 def gpu_gate(job: dict, force: bool = False):
-    """LLM を呼ぶ前に毎回呼ぶ。キャンセルを反映し、PaddleOCR が動いていれば止まるまで待つ（GPU の取り合いで LLM が落ちるため）"""
+    """LLM を呼ぶ前に毎回呼ぶ。中止を反映する。
+    GPU の取り合いは工程の順番で防ぐ: OCR（図面・マニュアルの画像）と LLM・埋め込みはどれもこのワーカーが1つずつ呼ぶので、
+    OCR の処理が終わってから次の工程に進む（PaddleOCR のアプリを止める必要はない）"""
     if job.get("cancel"):
         raise Cancelled()
-    if not ocr_running(force):
-        return
-    with gpu_lock:  # 並列の LLM 呼び出しのうち1本だけが確認を続け、ほかは待つ
-        if not ocr_running(force=True):
-            return
-        job["wait_ocr"] = True
-        job["log"].append(time.strftime("%H:%M:%S ") + "PaddleOCR が動いているため LLM を止めて待ちます。PaddleOCR を停止すると自動で再開します")
-        while ocr_running(force=True):
-            if job.get("cancel"):
-                job["wait_ocr"] = False
-                raise Cancelled()
-            time.sleep(10)
-        job["wait_ocr"] = False
-        job["log"].append(time.strftime("%H:%M:%S ") + "PaddleOCR の停止を確認。LLM を再開します")
 
 
 class step:
@@ -343,6 +540,163 @@ class step:
         return False
 
 
+def ds_fill_vectors(cfg: dict) -> int:
+    """使用オンのマニュアルで埋め込みが未計算のチャンクを計算して保存する。計算した数を返す"""
+    n = 0
+    with ds_lock:
+        items = ds_items()
+        for x in items:
+            if not x.get("enabled") or x.get("embedded"):
+                continue
+            chunks = ds_chunks(x["id"])
+            if not chunks and (ds_dir() / f"{x['id']}.txt").exists():  # チャンク分割より前の版で取り込んだもの
+                chunks = _write_chunks_rules(x, ds_text(x["id"]))
+            if chunks:
+                for c, v in zip(chunks, embed([c["text"] for c in chunks], cfg)):
+                    c["vec"] = v
+                (ds_dir() / f"{x['id']}.chunks.json").write_text(json.dumps(chunks, ensure_ascii=False), encoding="utf-8")
+                n += len(chunks)
+            x.update(embedded=True, embed_model=embed_model(cfg))
+            x["note"] = ""
+        ds_save(items)
+    return n
+
+
+def run_ds_task(item_id: str):
+    """マニュアルの GPU の処理（画像の OCR → 埋め込み → LLM でのルール読み取り）。
+    校正と同じワーカーで1件ずつ、段階ごとに順番に動くので、OCR・埋め込み・LLM が同時に GPU を使わない。段階ごとに保存し、メモリはその都度返す"""
+    def get():
+        return next((x for x in ds_items() if x["id"] == item_id), None)
+
+    def update(**kw):
+        with ds_lock:
+            items = ds_items()
+            it = next((x for x in items if x["id"] == item_id), None)
+            if it is None:
+                raise Cancelled()  # 処理中に削除された
+            it.update(kw)
+            ds_save(items)
+            return it
+
+    item = get()
+    if item is None:
+        return
+    cfg = load_config()
+    apply_config(cfg)
+    notes = []
+    pr.log = lambda m: None
+    try:
+        # 1) 画像の OCR（PaddleOCR が動いているときだけ。動いていなければ未読み取りのまま）
+        if item.get("images_unread") and _orig(item).exists():
+            if ocr_running(force=True):
+                update(task=f"画像の読み取り中（{item['images_unread']} 件）")
+                text, images, unread = extract_text(item["name"], _orig(item).read_bytes(), ocr=True)
+                with ds_lock:
+                    items = ds_items()
+                    it = next(x for x in items if x["id"] == item_id)
+                    it.update(images=images, images_unread=unread)
+                    _write_chunks_rules(it, text)
+                    ds_save(items)
+                gc.collect()
+            else:
+                notes.append("PaddleOCR が停止中のため画像は未読み取り（起動してから「再処理」）")
+
+        # 2) 埋め込み（EMBED_BATCH 件ずつ）
+        chunks = ds_chunks(item_id)
+        if chunks:
+            update(task="埋め込みを計算中")
+            try:
+                vecs = embed([c["text"] for c in chunks], cfg)
+                for c, v in zip(chunks, vecs):
+                    c["vec"] = v
+                with ds_lock:
+                    (ds_dir() / f"{item_id}.chunks.json").write_text(json.dumps(chunks, ensure_ascii=False), encoding="utf-8")
+                update(embedded=True, embed_model=embed_model(cfg))
+            except Cancelled:
+                raise
+            except Exception as e:
+                notes.append(f"埋め込みは未計算（{str(e)[:80]}）")
+            del chunks
+            gc.collect()
+
+        # 3) LLM でのルール読み取り（書式から読み取れない自由な書き方の項目）
+        if cfg.get("rule_llm", "1") == "1":
+            chunks = ds_chunks(item_id)
+            llm = pr.LLM(cfg["llm_base_url"], cfg["llm_model"], cfg["llm_api_key"] or None, verbose=False)
+            def stop_if_deleted():
+                if get() is None:
+                    raise Cancelled()
+            pr.BEFORE_CALL = stop_if_deleted
+            got: list[dict] = []
+            try:
+                for i, c in enumerate(chunks, 1):
+                    update(task=f"LLM でルールを読み取り中 {i}/{len(chunks)}")
+                    got += pr.llm_manual_rules(llm, c)
+            except Cancelled:
+                raise
+            except BaseException as e:  # LLM に届かないなど（SystemExit を含む）。書式から読み取ったルールは残す
+                notes.append(f"LLM でのルール読み取りは途中まで（{str(e)[:80]}）")
+            finally:
+                pr.BEFORE_CALL = None
+            with ds_lock:
+                items = ds_items()
+                it = next((x for x in items if x["id"] == item_id), None)
+                if it is None:
+                    raise Cancelled()
+                old = {r["type"] + r["from"] + r["to"]: r.get("enabled", True) for r in ds_rules(item_id)}
+                rules = pr.dedupe_rules([r for r in ds_rules(item_id) if r["by"] != "LLM"] + got)
+                for r in rules:
+                    r["enabled"] = old.get(r["type"] + r["from"] + r["to"], True)
+                (ds_dir() / f"{item_id}.rules.json").write_text(json.dumps(rules, ensure_ascii=False, indent=1), encoding="utf-8")
+                it.update(rules=len(rules), rules_llm=sum(1 for r in rules if r["by"] == "LLM"), llm_done=True)
+                ds_save(items)
+        update(task="", note=" / ".join(notes))
+    except Cancelled:
+        pass
+    except Exception as e:
+        try:
+            update(task="", note=f"処理できませんでした: {str(e)[:120]}")
+        except Cancelled:
+            pass
+    finally:
+        pr.BEFORE_CALL = None
+        gc.collect()
+
+
+def prepare_manual(job: dict, cfg: dict, paras, seg_chars: int):
+    """校正方針の渡し方を決める。マニュアルが長ければ、区切りごとに埋め込みで近い項目を top_k 個だけ選んで渡す"""
+    chunks = ds_active_chunks()
+    job["cites"] = {c["cid"]: (c["name"], c["text"]) for c in chunks}
+    if not chunks:
+        return skip(job, "retrieve", "マニュアルなし（既定の方針）")
+    total = sum(len(c["text"]) for c in chunks)
+    mode = cfg.get("manual_mode", "auto")
+    if mode == "full" or (mode == "auto" and total <= MANUAL_WARN_CHARS):
+        return skip(job, "retrieve", f"全文を使用（{len(chunks)} 項目 / {total:,} 字）")
+    k = max(1, int(cfg.get("top_k") or 6))
+    with step(job, "retrieve") as st:
+        gpu_gate(job)
+        try:
+            filled = ds_fill_vectors(cfg)
+            chunks = ds_active_chunks()
+            groups = pr.segments(paras, seg_chars)
+            qv = embed(["\n".join(p.text for p in g) for g in groups], cfg)
+            order_of = {c["cid"]: i for i, c in enumerate(chunks)}
+            picks = []
+            for v in qv:
+                top = sorted((c for c in chunks if c.get("vec")), key=lambda c: -_cos(v, c["vec"]))[:k]
+                picks.append(numbered(sorted(top, key=lambda c: order_of[c["cid"]])))
+            pr.MANUAL_FOR = lambda gi, picks=picks: picks[gi] if gi < len(picks) else pr.MANUAL
+            st["note"] = f"区切り {len(groups)} × 上位 {k} 項目（全 {len(chunks)} 項目）"
+            pr.log(f"マニュアルの検索: {st['note']}" + (f"。未計算だった埋め込み {filled} 件を計算" if filled else ""))
+        except Cancelled:
+            raise
+        except Exception as e:
+            pr.MANUAL_FOR = None
+            st["note"] = "検索できず全文を使用"
+            pr.log(f"マニュアルの検索ができないため全文を使います（{str(e)[:200]}）")
+
+
 def skip(job: dict, key: str, note: str):
     job["steps"][key].update(status="スキップ", note=note)
 
@@ -350,6 +704,10 @@ def skip(job: dict, key: str, note: str):
 def worker():
     while True:
         jid = q.get()
+        if isinstance(jid, tuple):  # ("ds", マニュアルの id)
+            run_ds_task(jid[1])
+            q.task_done()
+            continue
         job = jobs[jid]
         job["status"] = "実行中"
         job["started"] = time.time()
@@ -374,10 +732,16 @@ def worker():
             cfg = load_config()
             apply_config(cfg)
             with step(job, "rules") as st:
+                mrules = ds_active_rules()
+                by_type = lambda t: [r["from"] for r in mrules if r["type"] == t]
+                pr.configure_symbols(prefix=by_type("symbol_prefix"), exclude=by_type("symbol_exclude"))
+                ignore_words = by_type("ignore")
                 table = pr.symbol_table(paras)
                 findings = pr.rule_checks(paras, table)
-                st["note"] = f"{len(findings)} 件（符号 {len(table)} 個）"
-                log(f"ルールチェック（対応表・語の重複・表記ゆれ）: {st['note']}")
+                got = pr.manual_rule_checks(paras, mrules)
+                findings += got
+                st["note"] = f"{len(findings)} 件（符号 {len(table)} 個・マニュアルの規則 {len(got)} 件）"
+                log(f"ルールチェック（対応表・語の重複・表記ゆれ・マニュアルの規則 {len(mrules)} 個）: {st['note']}")
             pdfs = sorted(x for x in src.parent.glob("*.pdf") if "図" in x.name)
             if not pdfs:
                 skip(job, "drawing", "図面PDFなし")
@@ -392,14 +756,17 @@ def worker():
                     findings += got
                     st["note"] = f"{len(got)} 件" + ("（OCR で読み取り）" if use_ocr else "（保存済みの OCR 結果）" if cached else "")
             if rules_only:
+                skip(job, "retrieve", "ルールのみ")
                 skip(job, "vote", "ルールのみ")
                 skip(job, "verify", "ルールのみ")
                 log("ルールのみモード（LLM は使いません）")
             else:
                 llm = pr.LLM(cfg["llm_base_url"], cfg["llm_model"], cfg["llm_api_key"] or None, verbose=True)
+                seg_chars = int(os.environ.get("PROOF_SEGMENT_CHARS", "1200"))
+                prepare_manual(job, cfg, paras, seg_chars)
                 with step(job, "vote") as st:
-                    gpu_gate(job, force=True)  # 図面の OCR のあと PaddleOCR が止まるのを待ってから LLM を始める
-                    adopted, single, gtext = pr.llm_vote(llm, paras, int(os.environ.get("PROOF_SEGMENT_CHARS", "1200")))
+                    gpu_gate(job)
+                    adopted, single, gtext = pr.llm_vote(llm, paras, seg_chars)
                     st["note"] = llm.short()
                     log(f"LLM 観点チェック: {llm.summary()}")
                 with step(job, "verify") as st:
@@ -411,8 +778,14 @@ def worker():
                 findings += adopted
             with step(job, "write") as st:
                 located = [f for f in findings if pr.locate(f, paras)]
-                final = pr.dedupe(located)
+                final = [f for f in pr.dedupe(located) if not pr.is_ignored(f, ignore_words)]
                 log(f"指摘 {len(final)} 件（原文に見つからない引用 {len(findings) - len(located)} 件を除外）")
+                notes = [f.note for f in final]
+                cites = job.get("cites") or {}
+                for f in final:  # コメントと CSV には根拠の項目の冒頭も書く（どこに基づく指摘か docx だけで追えるように）
+                    used = [c for c in dict.fromkeys(pr.CITE_RE.findall(f.note)) if c[1:-1] in cites]
+                    if used:
+                        f.note += "".join(f"\n{c} {cites[c[1:-1]][0]}: {cites[c[1:-1]][1][:80]}" for c in used)
                 pr.apply_to_docx(doc, final)
                 tag = "【AI校正・ルールのみ】" if rules_only else "【AI校正】"
                 suffix = "_ルールのみ" if rules_only else ""
@@ -428,7 +801,7 @@ def worker():
                         w.writerow([i, f.label, f.before, f.after, f.kind, f.note, "○" if f.needs_check else "", f.applied, f.source, f"{f.votes}/{pr.VOTE_RUNS}" if f.votes else "ルール"])
                 pr.write_table_csv(out_tbl, table)
                 job["outputs"] = [str(out_docx), str(out_csv), str(out_tbl)]
-                job["rows"] = [(f.label, f.before, f.after, f.kind, f.note, f.applied) for f in final]
+                job["rows"] = [(f.label, f.before, f.after, f.kind, n, f.applied) for f, n in zip(final, notes)]
                 job["table"] = pr.table_rows(table)
                 st["note"] = f"{len(final)} 件"
             job["status"] = "完了"
@@ -447,8 +820,9 @@ def worker():
             if st["status"] == "待機":
                 st["status"] = "—"
         job["current"] = None
-        job["wait_ocr"] = False
         pr.BEFORE_CALL = None
+        pr.MANUAL_FOR = None
+        pr.configure_symbols()
         job["finished"] = time.time()
         gc.collect()
         q.task_done()
@@ -529,7 +903,10 @@ pre{margin:0;white-space:pre-wrap;font-size:12px;background:#1f2329;color:#d7dae
 .form input,.form select,textarea{width:100%;padding:7px 10px;border:1px solid var(--line);border-radius:8px;font:inherit;background:var(--panel)}
 .form input:focus,.form select:focus,textarea:focus,.search:focus{outline:none;border-color:var(--pri);box-shadow:0 0 0 3px var(--pri-bg)}
 .form .hint{font-size:12px;color:var(--faint);margin-top:4px}
-.steps{display:grid;grid-template-columns:repeat(6,1fr);gap:0;padding:18px}
+.steps{display:grid;grid-template-columns:repeat(7,1fr);gap:0;padding:18px}
+.cite{display:inline-block;background:var(--pri-bg);color:var(--pri);border-radius:6px;padding:0 5px;font-size:12px;cursor:help}
+.chunk{border:1px solid var(--line);border-radius:8px;padding:8px 12px;font-size:13px;white-space:pre-wrap;margin-bottom:8px}.chunk b{color:var(--pri);margin-right:6px}
+.chunks{max-height:60vh;overflow:auto}
 .stp{position:relative;padding:0 8px;text-align:center;font-size:12px;color:var(--sub)}
 .stp::before{content:"";position:absolute;top:13px;left:-50%;right:50%;height:2px;background:var(--line)}
 .stp:first-child::before{display:none}.stp.done::before,.stp.run::before{background:var(--pri)}
@@ -538,8 +915,6 @@ pre{margin:0;white-space:pre-wrap;font-size:12px;background:#1f2329;color:#d7dae
 .stp.ng .dot{background:var(--ng);color:#fff}.stp.skip .dot{background:var(--bg);color:var(--faint)}
 .stp b{display:block;color:var(--text);font-size:13px}.stp .res{font-size:11px;color:var(--faint)}
 .stp .sn{font-size:11px;color:var(--sub);margin-top:2px;word-break:break-all}
-.banner{display:flex;gap:12px;align-items:center;background:var(--run-bg);color:#8a4a12;border:1px solid #f5c99b;border-radius:12px;padding:12px 16px;margin-bottom:16px;font-size:13px}
-.banner b{display:block;font-size:14px}
 .switch{position:relative;width:36px;height:20px;flex:none;display:inline-block}.switch input{display:none}
 .switch i{position:absolute;inset:0;border-radius:999px;background:#c9cdd4;transition:.15s;cursor:pointer}
 .switch i::after{content:"";position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;background:#fff;transition:.15s}
@@ -555,7 +930,7 @@ details.def summary{cursor:pointer;color:var(--sub);font-size:13px}details.def p
  .app{flex-direction:column}.side{width:auto;height:auto;position:static;flex-direction:row;align-items:center;padding:10px 12px;border-right:0;border-bottom:1px solid var(--line);overflow-x:auto}
  .brand{padding:0 8px 0 0}.brand span,.side .foot{display:none}.main{width:100%;padding:18px 16px 40px}
  .stats{grid-template-columns:repeat(3,1fr);gap:8px}.stat{padding:10px 12px}.stat .v{font-size:18px}.bar .muted{display:none}
- .tbl .hide-sm{display:none}.steps{grid-template-columns:repeat(3,1fr);row-gap:16px}.stp:nth-child(4)::before{display:none}.tbl td,.tbl th{padding:10px 12px}.form{grid-template-columns:1fr}.form label{padding-top:0}
+ .tbl .hide-sm{display:none}.steps{grid-template-columns:repeat(3,1fr);row-gap:16px}.stp:nth-child(3n+1)::before{display:none}.tbl td,.tbl th{padding:10px 12px}.form{grid-template-columns:1fr}.form label{padding-top:0}
 }
 """
 
@@ -623,8 +998,6 @@ def job_tag(jid: str, show_mode: bool = True) -> str:
     if st == "待機中":
         ahead = sum(1 for o in order if o < jid and jobs[o]["status"] in ("待機中", "実行中"))
         label = f"待機中（{ahead}件待ち）" if ahead else st
-    elif st == "実行中" and j.get("wait_ocr"):
-        return '<span class="tag run">PaddleOCR の停止待ち</span>'
     elif st == "実行中" and j.get("started"):
         cur = STEP_NAME.get(j.get("current") or "")
         label = f"{cur[0]}/{len(STEPS)} {cur[1]} ・ {fmt_dur(time.time() - j['started'])}" if cur else f"実行中 {fmt_dur(time.time() - j['started'])}"
@@ -798,8 +1171,7 @@ def page_index() -> str:
 
 <div class=modal id=runModal><div class=dlg><h3>校正を開始<button class=x data-close>×</button></h3><div class=in>
 <p style=margin-top:0><b id=runName></b></p>
-<p>抽出 → 機械チェック → 図面の照合 → LLM 観点チェック → LLM 検証 → 書き出し の順に1工程ずつ進めます。2万字で 30分前後かかります。画面を閉じても処理は続きます。</p>
-<p class=muted>図面をまだ読み取っていない場合は PaddleOCR を起動しておいてください。読み取りが終わると、PaddleOCR が停止されるのを待ってから LLM の工程に進みます（GPU の取り合いを防ぐため）。</p></div>
+<p>2万字で 30分前後かかります。</p></div>
 <div class=ft><button class="btn ghost" data-close>キャンセル</button><button class=btn id=runOk>{ICONS["play"]}開始する</button></div></div></div>
 <div class=dropall id=dropAll>ここにドロップして追加</div>"""
     return shell("明細書", "docs", body, INDEX_JS, any_busy())
@@ -856,7 +1228,12 @@ def page_settings(msg: str = "") -> str:
 <div class=card><h2>処理の内容</h2><div class="body form">
 {row("全文の観点チェック（LLM）", sel_kv("whole_views", cfg.get("whole_views", "0"), [("0", "使わない（推奨）"), ("1", "使う")]))}
 </div></div>
-<div class=card><h2>校正方針</h2><div class=body><p class=muted style=margin:0>校正マニュアルは <a href=/dataset>データセット</a> で追加・更新・削除できます。</p></div></div>
+<div class=card><h2>校正方針（<a href=/dataset>データセット</a>）</h2><div class="body form">
+{row("マニュアルの渡し方", sel_kv("manual_mode", cfg.get("manual_mode", "auto"), [("auto", f"自動（{MANUAL_WARN_CHARS:,} 字までは全文、超えたら検索）"), ("full", "常に全文"), ("search", "常に検索")]))}
+{row("埋め込みモデル", sel_kv("embed_model", cfg.get("embed_model", ""), [("", f"自動（{html.escape(embed_model(dict(cfg, embed_model=''), models) or '見つかりません')}）")] + [(html.escape(m), html.escape(m)) for m in models if "embed" in m.lower()]))}
+{row("検索で渡す項目数", sel("top_k", str(cfg.get("top_k", "6")), ["4", "6", "8", "12"]))}
+{row("ルールの読み取り（LLM）", sel_kv("rule_llm", cfg.get("rule_llm", "1"), [("1", "使う"), ("0", "使わない（書式から読み取れるものだけ）")]))}
+</div></div>
 <button class=btn>保存して接続確認</button></form>"""
     return shell("設定", "settings", body, toast)
 
@@ -887,6 +1264,14 @@ if (document.body.dataset.busy === '1') setTimeout(poll, 4000);
 </script>"""
 
 
+def cite_html(note: str, cites: dict) -> str:
+    """備考の［M1-2］を、マニュアルの該当項目をツールチップで見られる印にする"""
+    def rep(m):
+        c = cites.get(m.group(0)[1:-1])
+        return f'<span class=cite title="{html.escape(c[0] + chr(10) + c[1])}">{m.group(0)}</span>' if c else m.group(0)
+    return pr.CITE_RE.sub(rep, html.escape(note))
+
+
 def page_job(jid: str) -> str:
     j = jobs[jid]
     src = Path(j["path"])
@@ -904,9 +1289,6 @@ def page_job(jid: str) -> str:
         f'<b>{name}</b><div class=res>{res}{" ・ " + fmt_dur(steps[k]["secs"]) if steps.get(k, {}).get("secs") is not None else ""}</div>'
         f'<div class=sn>{html.escape(steps.get(k, {}).get("note", "") if steps.get(k, {}).get("status") != "待機" else "")}</div></div>'
         for i, (k, name, res) in enumerate(STEPS, 1))
-    banner = ('<div class=banner><div style=font-size:22px>⏸</div><div><b>PaddleOCR を停止してください</b>'
-              '図面の読み取りは終わっています。PaddleOCR が動いたままだと GPU を取り合って LLM が止まるため、停止を確認してから LLM の工程を自動で再開します'
-              '（Olares の Market → PaddleOCR → 停止）。</div></div>') if j.get("wait_ocr") else ""
     trows = j.get("table") or []
     ttable = ""
     if trows:
@@ -935,7 +1317,7 @@ def page_job(jid: str) -> str:
             f'<tr data-kind="{html.escape(kind)}"><td class="muted" style=white-space:nowrap>{html.escape(label)}</td>'
             + (f'<td class=diff><del>{html.escape(before)}</del></td><td class=diff><ins>{html.escape(after)}</ins></td>' if after else
                f'<td class=diff>{html.escape(before)}</td><td class=muted>—</td>')
-            + f'<td><span class=tag>{html.escape(kind)}</span></td><td class="hide-sm" style=font-size:13px>{html.escape(note)}</td>'
+            + f'<td><span class=tag>{html.escape(kind)}</span></td><td class="hide-sm" style=font-size:13px>{cite_html(note, j.get("cites") or {})}</td>'
             f'<td><span class="tag {APPLIED.get(ap, (ap, ""))[1]}">{html.escape(APPLIED.get(ap, (ap, ""))[0])}</span></td></tr>'
             for label, before, after, kind, note, ap in rows)
         table = f"""<div class=card><h2>修正箇所</h2><div class=bar><div class=chips>{chips}</div></div>
@@ -943,7 +1325,7 @@ def page_job(jid: str) -> str:
     body = f"""<div class=crumb><a href=/>明細書</a> / {html.escape(src.name)}</div>
 <div class=head><div><h1>{html.escape(src.name)}</h1><p>{job_tag(jid, show_mode=False)} <span class=muted>{"ルールのみ" if j.get("mode") == "rules" else "フル校正"} ・ 経過 {el} ・ Documents/{html.escape(rel(src.parent))}</span></p></div>
 <div class=acts>{dl}</div></div>
-{banner}<div class=card><h2>工程</h2><div class=steps>{stepper}</div></div>
+<div class=card><h2>工程</h2><div class=steps>{stepper}</div></div>
 {stats}{table}{ttable}
 <div class=card><details class=log{" open" if busy or j["status"] == "エラー" else ""}><summary>ログ</summary><pre>{html.escape(chr(10).join(j["log"][-200:])) or "（待機中）"}</pre></details></div>"""
     return shell(src.name, "docs", body, JOB_JS, busy)
@@ -953,32 +1335,51 @@ def ds_rows() -> str:
     rows = []
     for x in ds_items():
         on = " checked" if x.get("enabled") else ""
-        rows.append(f'<tr data-name="{html.escape(x["name"].lower())}"><td><div class=fname>{html.escape(x["name"])}</div><div class=fdir>{html.escape(x.get("source", ""))}</div></td>'
-                    f'<td class=hide-sm>{x.get("chars", 0):,} 字</td><td class="hide-sm muted">{fmt_time(x.get("updated", 0))}</td>'
+        emb = ('<span class="tag ok">埋め込み済み</span>' if x.get("embedded") else '<span class=tag>埋め込み未計算</span>') if x.get("chunks") else ""
+        img = ""
+        if x.get("images"):
+            unread = x.get("images_unread", 0)
+            img = f'<span class="tag {"run" if unread else "ok"}">画像 {x["images"]}{f"（未読み取り {unread}）" if unread else "（読み取り済み）"}</span>'
+        note = f'<div class=note title="{html.escape(x.get("note", ""))}">{html.escape(x.get("note", ""))}</div>' if x.get("note") else ""
+        if x.get("task"):
+            note = f'<div><span class="tag run">{html.escape(x["task"])}</span></div>' + note
+        rules = f'<span class=tag>ルール {x.get("rules", 0)}（LLM {x.get("rules_llm", 0)}）</span>' if x.get("rules") else ""
+        rows.append(f'<tr data-name="{html.escape(x["name"].lower())}" data-task="{1 if x.get("task") else 0}"><td><div class=fname>{html.escape(x["name"])}</div>'
+                    f'<div class=fdir>{html.escape(x.get("code", ""))} ・ {html.escape(x.get("source", ""))}</div></td>'
+                    f'<td class=hide-sm>{x.get("chars", 0):,} 字<div class=muted>{x.get("chunks", 0)} チャンク</div></td>'
+                    f'<td class=hide-sm>{emb} {rules} {img}{note}</td><td class="hide-sm muted">{fmt_time(x.get("updated", 0))}</td>'
                     f'<td><label class=switch title="校正に使う"><input type=checkbox data-toggle="{x["id"]}"{on}><i></i></label></td>'
-                    f'<td><div class=acts><button class="btn ghost sm" data-edit="{x["id"]}">編集</button>'
-                    f'<a class="btn ghost sm" href="/dataset/{x["id"]}/download">{ICONS["down"]}</a>'
+                    f'<td><div class=acts><button class="btn ghost sm" data-chunks="{x["id"]}">チャンク</button>'
+                    f'<button class="btn ghost sm" data-rules="{x["id"]}">ルール</button>'
+                    f'<button class="btn ghost sm" data-edit="{x["id"]}">編集</button>'
+                    f'<button class="btn ghost sm" data-re="{x["id"]}" title="画像の読み取り・チャンク分割・埋め込みをやり直す">再処理</button>'
+                    f'<a class="btn ghost sm" href="/dataset/{x["id"]}/download" title="取り出した本文をダウンロード">{ICONS["down"]}</a>'
                     f'<button class="btn danger sm" data-del="{x["id"]}" data-name="{html.escape(x["name"])}">削除</button></div></td></tr>')
-    return "".join(rows) or '<tr><td colspan=5 class=empty>マニュアルがまだありません。「マニュアルを追加」から .txt / .md / .docx / .pdf を取り込んでください。<br>マニュアルがない間は下の既定の方針で校正します。</td></tr>'
+    return "".join(rows) or '<tr><td colspan=6 class=empty>マニュアルがまだありません。「マニュアルを追加」から取り込んでください。<br>マニュアルがない間は下の既定の方針で校正します。</td></tr>'
 
 
 def ds_summary() -> str:
     items = ds_items()
     on = [x for x in items if x.get("enabled")]
-    chars = len(ds_manual())
-    msg = (f'<div class=stat><div class=k>マニュアル</div><div class=v>{len(items)}</div></div>'
-           f'<div class=stat><div class=k>校正に使用中</div><div class=v>{len(on)}</div></div>'
-           f'<div class=stat><div class=k>使用中の文字数</div><div class=v>{chars:,}</div></div>')
-    return msg
+    chars = sum(x.get("chars", 0) for x in on)
+    return (f'<div class=stat><div class=k>マニュアル</div><div class=v>{len(items)}</div></div>'
+            f'<div class=stat><div class=k>校正に使用中</div><div class=v>{len(on)}</div></div>'
+            f'<div class=stat><div class=k>使用中のチャンク</div><div class=v>{sum(x.get("chunks", 0) for x in on)}</div></div>'
+            f'<div class=stat><div class=k>使用中の文字数</div><div class=v>{chars:,}</div></div>')
 
 
 def ds_warn() -> str:
-    chars = len(ds_manual())
-    if chars > MANUAL_WARN_CHARS:
-        return (f'<div class=warn>使用中のマニュアルが {chars:,} 字あります。マニュアルは LLM の毎回の呼び出し（1件あたり 150 回前後）に入るため、'
-                f'長いほど校正が遅くなります。校正に関係する項目だけに絞るか、使わないものをオフにしてください。</div>')
-    if not chars:
+    on = [x for x in ds_items() if x.get("enabled")]
+    chars = sum(x.get("chars", 0) for x in on)
+    if not on:
         return '<div class=warn style="background:var(--pri-bg);color:var(--pri)">使用中のマニュアルがないため、既定の方針で校正します。</div>'
+    mode = load_config().get("manual_mode", "auto")
+    if mode != "full" and (mode == "search" or chars > MANUAL_WARN_CHARS):
+        miss = [x["name"] for x in on if not x.get("embedded")]
+        msg = f'{chars:,} 字あるため、区切りごとに関係する項目だけを検索して渡します。'
+        if miss:
+            msg += f' 埋め込みが未計算のもの（{html.escape("、".join(miss))}）は次の校正の開始時に計算します。'
+        return f'<div class=warn style="background:var(--pri-bg);color:var(--pri)">{msg}</div>'
     return ""
 
 
@@ -992,7 +1393,13 @@ function filter() { const v = $('#q').value.trim().toLowerCase(); document.query
 async function refresh() {
   const d = await (await fetch('/api/dataset')).json();
   $('#rows').innerHTML = d.rows; $('#stats').innerHTML = d.stats; $('#warn').innerHTML = d.warn; filter();
+  poll();
 }
+// OCR・埋め込み・ルール読み取りの処理中は数秒ごとに更新
+function poll() { clearTimeout(window._poll); if (document.querySelector('#rows tr[data-task="1"]')) window._poll = setTimeout(refresh, 4000); }
+poll();
+const TYPE = {replace: '置換', forbid: '使わない語', regex: '正規表現', ignore: '指摘しない語', symbol_exclude: '符号でない語', symbol_prefix: '名称の前の語'};
+let rulesOf = null;
 document.querySelectorAll('[data-open]').forEach(b => b.onclick = () => { reset(); show(modal); });
 document.querySelectorAll('[data-close]').forEach(b => b.onclick = () => hide(b.closest('.modal')));
 document.querySelectorAll('.modal').forEach(m => m.addEventListener('click', e => { if (e.target === m && !m.dataset.lock) hide(m); }));
@@ -1000,12 +1407,33 @@ function reset() { flist.innerHTML = ''; upErr.textContent = ''; pick.value = ''
 
 // 使う／使わない・編集・削除
 document.addEventListener('change', async e => {
+  const rl = e.target.closest('[data-rule]');
+  if (rl) { await fetch(`/dataset/${rulesOf}/rule`, {method: 'POST', body: new URLSearchParams({idx: rl.dataset.rule, enabled: rl.checked ? '1' : '0'})});
+    toast(rl.checked ? 'このルールを使います' : 'このルールを使わないようにしました'); return; }
   const t = e.target.closest('[data-toggle]'); if (!t) return;
   await fetch(`/dataset/${t.dataset.toggle}/toggle`, {method: 'POST', body: new URLSearchParams({enabled: t.checked ? '1' : '0'})});
   toast(t.checked ? '校正に使います' : '校正に使わないようにしました'); refresh();
 });
 let editing = null, deleting = null;
+const esc = t => t.replace(/[&<>"]/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[c]));
 document.addEventListener('click', async e => {
+  const ch = e.target.closest('[data-chunks]');
+  if (ch) { const d = await (await fetch(`/dataset/${ch.dataset.chunks}/chunks`)).json();
+    $('#chName').textContent = d.name;
+    $('#chList').innerHTML = d.chunks.map(c => `<div class=chunk><b>［${c.cid}］</b>${c.vec ? '' : '<span class=tag>埋め込み未計算</span> '}${esc(c.text)}</div>`).join('') || '<p class=muted>チャンクがありません</p>';
+    show($('#chModal')); return; }
+  const ru = e.target.closest('[data-rules]');
+  if (ru) { rulesOf = ru.dataset.rules; const d = await (await fetch(`/dataset/${rulesOf}/rules`)).json();
+    $('#ruName').textContent = d.name;
+    $('#ruList').innerHTML = d.rules.length ? '<table class=tbl><thead><tr><th>使用</th><th>種類</th><th>内容</th><th>根拠</th><th>読み取り</th></tr></thead><tbody>' + d.rules.map((r, i) =>
+      `<tr><td><label class=switch><input type=checkbox data-rule="${i}"${r.enabled ? ' checked' : ''}><i></i></label></td><td><span class=tag>${TYPE[r.type] || r.type}</span></td>`
+      + `<td><code>${esc(r.from)}</code>${r.to ? ' → <code>' + esc(r.to) + '</code>' : ''}<div class=muted>${esc(r.note || '')}</div></td><td><span class=cite>［${esc(r.cid)}］</span></td><td class=muted>${r.by}</td></tr>`).join('') + '</tbody></table>'
+      : '<p class=muted>読み取れたルールはありません。</p>';
+    show($('#ruModal')); return; }
+  const re = e.target.closest('[data-re]');
+  if (re) { re.disabled = true; re.textContent = '処理中…';
+    const r = await fetch(`/dataset/${re.dataset.re}/reprocess`, {method: 'POST'});
+    toast(r.ok ? '再処理しました' : '再処理できませんでした'); refresh(); return; }
   const ed = e.target.closest('[data-edit]');
   if (ed) { const d = await (await fetch(`/dataset/${ed.dataset.edit}`)).json(); editing = ed.dataset.edit;
     $('#edName').textContent = d.name; $('#edText').value = d.text; $('#edCount').textContent = d.text.length.toLocaleString() + ' 字'; show($('#edModal')); return; }
@@ -1040,15 +1468,15 @@ function sendFile(f, bar) {
 }
 async function upload(files) {
   upErr.textContent = '';
-  const skipped = files.filter(f => !/\.(txt|md|docx|pdf)$/i.test(f.name) || f.name.startsWith('~$'));
+  const skipped = files.filter(f => !/\.(txt|md|docx|pdf|png|jpe?g)$/i.test(f.name) || f.name.startsWith('~$'));
   files = files.filter(f => !skipped.includes(f));
-  if (!files.length) { upErr.textContent = '.txt / .md / .docx / .pdf のファイルを選んでください。'; return; }
+  if (!files.length) { upErr.textContent = '.txt / .md / .docx / .pdf / .png / .jpg のファイルを選んでください。'; return; }
   modal.dataset.lock = '1';
   flist.innerHTML = files.map((f, i) => `<li><div class=row><span>${f.name.replace(/</g, '&lt;')}</span><span class=muted id=s${i}>${(f.size / 1024).toFixed(0)} KB</span></div><div class=prog><i id=p${i}></i></div></li>`).join('');
   let ok = true;
   for (const [i, f] of files.entries()) {
     const r = await sendFile(f, $('#p' + i));
-    $('#s' + i).textContent = r.ok ? `${r.updated ? '更新' : '追加'}（${r.chars.toLocaleString()} 字）` : '失敗';
+    $('#s' + i).textContent = r.ok ? `${r.updated ? '更新' : '追加'}（${r.chars.toLocaleString()} 字・${r.chunks} チャンク・ルール ${r.rules}）` : '失敗';
     if (!r.ok) { ok = false; upErr.textContent = `${f.name}: ${r.err}`; }
   }
   delete modal.dataset.lock;
@@ -1064,14 +1492,18 @@ def page_dataset() -> str:
 <button class=btn data-open>{ICONS["up"]}マニュアルを追加</button></div>
 <div class=stats id=stats>{ds_summary()}</div><div id=warn style=margin-bottom:16px>{ds_warn()}</div>
 <div class=card><div class=bar><input class=search id=q placeholder="名前で検索"></div>
-<table class=tbl><thead><tr><th>名前</th><th class=hide-sm>文字数</th><th class=hide-sm>更新日時</th><th>使用</th><th style=text-align:right>操作</th></tr></thead>
+<table class=tbl><thead><tr><th>名前</th><th class=hide-sm>文字数</th><th class=hide-sm>状態</th><th class=hide-sm>更新日時</th><th>使用</th><th style=text-align:right>操作</th></tr></thead>
 <tbody id=rows>{ds_rows()}</tbody></table></div>
 <div class=card><div class=body><details class=def><summary>既定の方針（使用中のマニュアルがないときに使います）</summary><pre>{html.escape(pr.DEFAULT_MANUAL)}</pre></details></div></div>
 
 <div class=modal id=upModal><div class=dlg><h3>マニュアルを追加<button class=x data-close>×</button></h3><div class=in>
-<div class=drop id=drop>{ICONS["up"]}<b>クリックして選択、またはドラッグ＆ドロップ</b><span class=muted>.txt / .md / .docx / .pdf（複数可）。本文の文字を取り出して保存します</span></div>
-<input type=file id=pick multiple accept=".txt,.md,.docx,.pdf" hidden><ul class=flist id=flist></ul><div class=err id=upErr></div>
+<div class=drop id=drop>{ICONS["up"]}<b>クリックして選択、またはドラッグ＆ドロップ</b><span class=muted>.txt / .md / .docx / .pdf / .png / .jpg（複数可）</span></div>
+<input type=file id=pick multiple accept=".txt,.md,.docx,.pdf,.png,.jpg,.jpeg" hidden><ul class=flist id=flist></ul><div class=err id=upErr></div>
 <p class=muted style=margin-bottom:0>同じ名前のマニュアルがあれば内容を置き換えます（使用のオン／オフはそのまま）。</p></div></div></div>
+
+<div class=modal id=ruModal><div class="dlg wide"><h3><span>ルール: <span id=ruName></span></span><button class=x data-close>×</button></h3><div class=in><div class=chunks id=ruList></div></div></div></div>
+
+<div class=modal id=chModal><div class="dlg wide"><h3><span>チャンク: <span id=chName></span></span><button class=x data-close>×</button></h3><div class=in><div class=chunks id=chList></div></div></div></div>
 
 <div class=modal id=edModal><div class="dlg wide"><h3><span>編集: <span id=edName></span></span><button class=x data-close>×</button></h3><div class=in>
 <textarea id=edText></textarea><div class=muted id=edCount style=text-align:right;margin-top:4px></div></div>
@@ -1112,6 +1544,11 @@ class H(BaseHTTPRequestHandler):
             item = next((x for x in ds_items() if x["id"] == parts[0]), None)
             if not item:
                 return self._send("not found", 404)
+            if parts[1:] == ["rules"]:
+                return self._send(json.dumps({"name": item["name"], "rules": ds_rules(item["id"])}, ensure_ascii=False), ctype="application/json")
+            if parts[1:] == ["chunks"]:
+                chunks = [{"cid": c["cid"], "text": c["text"], "vec": bool(c.get("vec"))} for c in ds_chunks(item["id"])]
+                return self._send(json.dumps({"name": item["name"], "chunks": chunks}, ensure_ascii=False), ctype="application/json")
             if parts[1:] == ["download"]:
                 b = ds_text(item["id"]).encode("utf-8")
                 self.send_response(200)
@@ -1155,6 +1592,13 @@ class H(BaseHTTPRequestHandler):
                 ds_update(parts[0], enabled=form.get("enabled", ["1"])[0] == "1")
             elif parts[1:] == ["delete"]:
                 ds_delete(parts[0])
+            elif parts[1:] == ["rule"]:
+                ds_update(parts[0], rule=int(form.get("idx", ["-1"])[0]), rule_on=form.get("enabled", ["1"])[0] == "1")
+            elif parts[1:] == ["reprocess"]:
+                try:
+                    ds_update(parts[0], reprocess=True)
+                except Exception as e:
+                    return self._send(str(e), 400)
             else:
                 return self._send("not found", 404)
             return self._send("ok")
@@ -1218,13 +1662,14 @@ class H(BaseHTTPRequestHandler):
                 raise ValueError("対応していない形式です（.txt / .md / .docx / .pdf）")
             if n > 20 * 1024 * 1024:
                 raise ValueError("ファイルが大きすぎます（20MB まで）")
-            text = extract_text(name, self.rfile.read(n))
-            if not text:
-                raise ValueError("文字を取り出せませんでした（画像だけの PDF など）")
-            item, updated = ds_put(name, text, "ファイルから取り込み")
+            item, updated = ds_put(name, self.rfile.read(n), "ファイルから取り込み")
+            if not item["chars"] and not item.get("images_unread"):
+                ds_delete(item["id"])
+                raise ValueError("文字を取り出せませんでした")
         except Exception as e:
             return self._send(f"{e}", 400)
-        self._send(json.dumps({"id": item["id"], "chars": item["chars"], "updated": updated}), ctype="application/json")
+        self._send(json.dumps({"id": item["id"], "chars": item["chars"], "chunks": item["chunks"], "rules": item.get("rules", 0), "updated": updated}),
+                   ctype="application/json")
 
     def _upload(self, qs: dict):
         n = int(self.headers.get("Content-Length", "0"))

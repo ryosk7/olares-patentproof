@@ -54,6 +54,18 @@ def _load_manual() -> str:
 
 
 MANUAL = _load_manual()
+# 区切りごとに校正方針を変えるとき（マニュアルの検索）に使う関数。区切り番号 → 校正方針。None なら MANUAL を使う
+MANUAL_FOR = None
+CITE_RE = re.compile(r"［M\d+-\d+］")
+
+
+def manual_for(gi: int | None) -> str:
+    return MANUAL_FOR(gi) if MANUAL_FOR and gi is not None else MANUAL
+
+
+def _cite_rule(manual: str) -> str:
+    """校正方針に項目番号（［M1-2］）が振ってあれば、指摘の根拠に番号を書かせる"""
+    return "\n- 校正方針の項目に当たる指摘は、備考の最後に根拠の項目番号を書く（例: 根拠［M1-2］）。番号のない一般的な誤りには書かない。" if CITE_RE.search(manual) else ""
 
 TYPES = ("タイポ", "不自然な表現", "用語の不統一", "図面・符号との一致")
 
@@ -124,9 +136,22 @@ def extract_paragraphs(doc) -> list[Para]:
 # 2. ルールチェック（名称と符号の対応表・語の重複・表記ゆれ）
 # ---------------------------------------------------------------------------
 NUM_RE = re.compile(rf"([ァ-ヶー一-龠々]{{2,}})([{FW_DIGIT}]{{1,4}}[{FW_UPPER}]?)(?![{FW_DIGIT}．{FW_UPPER}])")
-PREFIX_RE = re.compile(r"^(前記|上記|当該|該|各|及び|又は|並びに|若しくは)+")
-# 符号ではない「語＋数字」（文献番号・請求項・図番号・日付・式番号など）
-EXCLUDE_TERM = re.compile(r"(請求項|特許第|第|図|段落|ステップ|文献|番号|工程|特開|特表|再表|特願|実開|実願|国際公開|公報|式|数|表|頁|年|月|日)$")
+# 名称の前に付く語（取り除いてから名称とみなす）と、符号ではない「語＋数字」の語（文献番号・請求項・図番号・日付・式番号など）。
+# どちらも既定の語に、マニュアルから読み取ったルール（symbol_prefix / symbol_exclude）を configure_symbols() で足せる
+BASE_PREFIX = ["前記", "上記", "当該", "該", "各", "及び", "又は", "並びに", "若しくは"]
+BASE_EXCLUDE = ["請求項", "特許第", "第", "図", "段落", "ステップ", "文献", "番号", "工程", "特開", "特表", "再表", "特願",
+                "実開", "実願", "国際公開", "公報", "式", "数", "表", "頁", "年", "月", "日"]
+PREFIX_RE = EXCLUDE_TERM = None
+
+
+def configure_symbols(prefix: list[str] = (), exclude: list[str] = ()):
+    global PREFIX_RE, EXCLUDE_TERM
+    alt = lambda ws: "|".join(re.escape(w) for w in sorted(dict.fromkeys(ws), key=len, reverse=True) if w)
+    PREFIX_RE = re.compile(rf"^({alt(BASE_PREFIX + list(prefix))})+")
+    EXCLUDE_TERM = re.compile(rf"({alt(BASE_EXCLUDE + list(exclude))})$")
+
+
+configure_symbols()
 # 【符号の説明】の1項目（例: １０…撹拌装置 / １０　撹拌装置 / 10：撹拌装置）
 LEGEND_RE = re.compile(rf"(?<![{FW_DIGIT}0-9])([{FW_DIGIT}0-9]{{1,4}}[{FW_UPPER}A-Z]?)\s*(?:…+|‥+|：|:|－|-|\s)+\s*([^\s、，,…‥：:{FW_DIGIT}0-9][^\s、，,…‥：:]*)")
 Z2H = str.maketrans("０１２３４５６７８９ＡＢＣＤＥＦＧＨＩＪＫＬＭＮＯＰＱＲＳＴＵＶＷＸＹＺ", "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ")
@@ -279,6 +304,187 @@ def rule_checks(paras: list[Para], table: dict[str, dict] | None = None) -> list
     return symbol_checks(paras, table) + hyoki_checks(paras) + repeat_checks(paras)
 
 
+# ---------------------------------------------------------------------------
+# マニュアルから読み取ったルール
+#   replace        誤 → 正（from を to に直す）
+#   forbid         使わない語（from。to があれば言い換え案）
+#   regex          正規表現（pattern に当たる箇所を指摘。to があれば置換結果）
+#   ignore         指摘しない語（この語だけを直す指摘を出さない）
+#   symbol_exclude 符号として扱わない語（「特開２０１１」の「特開」など）
+#   symbol_prefix  名称の前に付く語（「前記」など。取り除いてから名称とみなす）
+# by: "書式"（マニュアルの書き方から機械的に読み取ったもの）/ "LLM"（LLM が読み取ったもの。指摘は要確認にする）
+# ---------------------------------------------------------------------------
+RULE_TYPES = ("replace", "forbid", "regex", "ignore", "symbol_exclude", "symbol_prefix")
+_Q = r"[「『\"“]([^」』\"”]{1,30})[」』\"”]"
+_FMT_RULES = [
+    # 「Ａ」→「Ｂ」 / 「Ａ」は「Ｂ」とする・に統一する・と表記する / 「Ａ」を「Ｂ」に改める
+    (re.compile(_Q + r"\s*(?:→|⇒|->|＞|は|を)\s*" + _Q + r"\s*(?:→|⇒)?\s*(?:に統一|とする|と表記|と記載|と書|に改め|に直|に修正|を用い|を使)?"), "replace", 1, 2),
+    # 「Ｂ」とし、「Ａ」としない / 「Ａ」ではなく「Ｂ」
+    (re.compile(_Q + r"\s*(?:ではなく|でなく|ではなし)\s*" + _Q), "replace", 1, 2),
+    # ×Ａ ○Ｂ / 誤：Ａ 正：Ｂ / （誤）Ａ（正）Ｂ / ＮＧ：Ａ ＯＫ：Ｂ
+    (re.compile(r"(?:×|✕|✗|誤[：:)）]|[（(]誤[)）]|NG[：:]|ＮＧ[：:])\s*「?([^\s「」○◯〇正×]{1,30}?)」?\s*[、，,／/]?\s*(?:○|◯|〇|正[：:)）]|[（(]正[)）]|OK[：:]|ＯＫ[：:])\s*「?([^\s「」×]{1,30}?)」?(?=\s|$|。|、)"), "replace", 1, 2),
+    # 「Ａ」は使わない・使用しない・用いない・禁止
+    (re.compile(_Q + r"\s*(?:は|を)\s*(?:使わ|使用し|用い|書か|記載し)(?:ない|ません)|" + _Q + r"\s*(?:は|を)?\s*禁止"), "forbid", None, None),
+    # 「Ａ」は指摘しない・確認しない・対象外
+    (re.compile(_Q + r"\s*(?:は|を)?\s*(?:指摘しない|指摘不要|確認しない|対象外|修正しない|直さない)"), "ignore", None, None),
+]
+_ARROW_LINE = re.compile(r"^[\s・\-*●○■□◆◇]*([^\s→⇒｜|]{1,20})\s*(?:→|⇒)\s*([^\s→⇒｜|]{1,20})\s*$")
+_TABLE_HEAD = re.compile(r"^(?:誤|NG|ＮＧ|修正前|×|旧|誤り|不可)\s*[｜|]\s*(?:正|OK|ＯＫ|修正後|○|新|正しい|可)")
+
+
+def parse_manual_rules(chunks: list[dict]) -> list[dict]:
+    """マニュアルの書き方（矢印・かぎ括弧・誤／正の表など）から、機械的に当てはめられるルールを読み取る（LLM は使わない）"""
+    out: list[dict] = []
+    for c in chunks:
+        in_table = False
+        for line in c["text"].splitlines():
+            line = line.strip()
+            if _TABLE_HEAD.match(line):
+                in_table = True
+                continue
+            cols = [x.strip(" 「」") for x in re.split(r"[｜|]", line)] if "｜" in line or "|" in line else []
+            if in_table and len(cols) >= 2:
+                if cols[0] and cols[1] and cols[0] != cols[1] and len(cols[0]) <= 30 and len(cols[1]) <= 30:
+                    out.append({"type": "replace", "from": cols[0], "to": cols[1], "note": line[:60], "cid": c["cid"], "by": "書式"})
+                continue
+            in_table = False
+            m = _ARROW_LINE.match(line)
+            if m and m.group(1) != m.group(2):
+                out.append({"type": "replace", "from": m.group(1).strip("「」"), "to": m.group(2).strip("「」"), "note": line[:60], "cid": c["cid"], "by": "書式"})
+                continue
+            for rx, typ, a, b in _FMT_RULES:
+                for m in rx.finditer(line):
+                    if typ == "replace":
+                        frm, to = m.group(a), m.group(b)  # 「Ａ」ではなく「Ｂ」も Ａ を Ｂ に
+                        if frm != to:
+                            out.append({"type": typ, "from": frm, "to": to, "note": line[:60], "cid": c["cid"], "by": "書式"})
+                    else:
+                        # 「Ａ」「Ｂ」は指摘しない のように並んだ語はすべて対象にする
+                        words = re.findall(_Q, line[:m.end()]) or [next(g for g in m.groups() if g)]
+                        for word in words:
+                            out.append({"type": typ, "from": word, "to": "", "note": line[:60], "cid": c["cid"], "by": "書式"})
+    return dedupe_rules(out)
+
+
+_BAD_REGEX = re.compile(r"\((?:[^()\\]|\\.)*[+*](?:[^()\\]|\\.)*\)[+*{]")  # (a+)+ のような入れ子の繰り返し（極端に遅くなる）
+
+
+def validate_rule(r: dict) -> dict | None:
+    """ルールの形を確かめて整える。使えないものは None"""
+    typ = r.get("type")
+    if typ not in RULE_TYPES:
+        return None
+    frm = str(r.get("from") or r.get("pattern") or "").strip()
+    to = str(r.get("to") or "").strip()
+    if not frm or len(frm) > 200:
+        return None
+    if typ == "regex":
+        if _BAD_REGEX.search(frm):
+            return None
+        try:
+            rx = re.compile(frm)
+        except re.error:
+            return None
+        if rx.search("") is not None or rx.search("あいうえお" * 20) and len(rx.search("あいうえお" * 20).group(0)) > 50:
+            return None  # 空文字や何にでも当たるパターンは使わない
+    elif len(frm) > 30 or (typ == "replace" and (not to or to == frm)):
+        return None
+    return {"type": typ, "from": frm, "to": to, "note": str(r.get("note") or "")[:120], "cid": r.get("cid", ""),
+            "by": r.get("by", "LLM"), "enabled": r.get("enabled", True)}
+
+
+def dedupe_rules(rules: list[dict]) -> list[dict]:
+    seen, out = set(), []
+    for r in rules:
+        r = validate_rule(r)
+        if r and (r["type"], r["from"], r["to"]) not in seen:
+            seen.add((r["type"], r["from"], r["to"]))
+            out.append(r)
+    return out
+
+
+SYS_RULES = """あなたは特許事務所の校正マニュアルを読み、文書に機械的に当てはめられる規則だけを抜き出す担当です。
+渡された抜粋から、次の種類の規則を1行に1つ、JSON で書いてください。当てはまるものがなければ「なし」とだけ書く。
+- {"type":"replace","from":"誤った書き方","to":"正しい書き方","note":"理由"}  … 表記の統一・言い換え（例: 行なう → 行う）
+- {"type":"forbid","from":"使わない語","to":"言い換え（あれば）","note":"理由"}
+- {"type":"regex","from":"Python の正規表現","to":"置換後（あれば。\\1 などの参照可）","note":"理由"}  … 字句だけでは書けない形の規則
+- {"type":"ignore","from":"指摘しない語","note":"理由"}
+- {"type":"symbol_exclude","from":"数字が続いても符号ではない語（例: 特開、式）","note":"理由"}
+- {"type":"symbol_prefix","from":"構成要素の名称の前に付く語（例: 前記）","note":"理由"}
+守ること:
+- 抜粋に書かれている規則だけを書く。推測で規則を作らない。文脈の判断が必要な規則（「適切に」「必要に応じて」など）は書かない。
+- from と to は抜粋の文字をそのまま使う。前置きや説明は書かない。"""
+
+
+def llm_manual_rules(llm, chunk: dict) -> list[dict]:
+    """LLM でマニュアルの1チャンクからルールを読み取る（書式から読み取れない自由な書き方の項目のため）"""
+    text = llm.chat(SYS_RULES, f"## 抜粋［{chunk['cid']}］\n{chunk['text']}", max_tokens=2048, temperature=0.1, top_p=0.3)
+    out = []
+    for line in text.splitlines():
+        line = line.strip().strip(",")
+        if not line.startswith("{"):
+            continue
+        try:
+            r = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(r, dict):
+            r.update(cid=chunk["cid"], by="LLM")
+            out.append(r)
+    return dedupe_rules(out)
+
+
+def manual_rule_checks(paras: list[Para], rules: list[dict], max_hits: int = 50) -> list[Finding]:
+    """マニュアルのルール（replace / forbid / regex）を本文に当てはめる。根拠の項目番号を備考に書く"""
+    out: list[Finding] = []
+    for r in rules:
+        if not r.get("enabled", True) or r["type"] not in ("replace", "forbid", "regex"):
+            continue
+        rx = re.compile(r["from"]) if r["type"] == "regex" else re.compile(re.escape(r["from"]))
+        cite = f" 根拠［{r['cid']}］" if r.get("cid") else ""
+        check = r.get("by") != "書式" or r["type"] != "replace"  # LLM が読み取ったルールと、言い換えの決まっていない指摘は要確認
+        hits = 0
+        for p in paras:
+            for m in rx.finditer(p.text):
+                s, e = m.span()
+                if s == e:
+                    continue
+                if r["type"] == "replace" and r["from"] in r["to"]:
+                    k = r["to"].find(r["from"])  # 正しい書き方の一部として出ている箇所（例: ため → ために の「ために」）は除く
+                    if p.text[s - k:s - k + len(r["to"])] == r["to"]:
+                        continue
+                if r["type"] == "regex":
+                    try:
+                        after_word = m.expand(r["to"]) if r["to"] else ""
+                    except (re.error, IndexError):
+                        after_word = ""
+                else:
+                    after_word = r["to"]
+                a, b = max(0, s - 4), min(len(p.text), e + 4)
+                after = p.text[a:s] + after_word + p.text[e:b] if after_word else ""
+                kind = "用語の不統一" if r["type"] == "replace" else "不自然な表現"
+                note = f"マニュアルの規則: {r.get('note') or r['from'] + ' → ' + (r['to'] or '使わない')}" + (" 要確認" if check else "") + cite
+                out.append(Finding("rule", p.label, p.text[a:b], after, kind, note, p.idx, a, needs_check=check))
+                hits += 1
+                if hits >= max_hits:
+                    break
+            if hits >= max_hits:
+                log(f"マニュアルの規則「{r['from']}」は {max_hits} 件で打ち切り")
+                break
+    return out
+
+
+def is_ignored(f: Finding, words: list[str]) -> bool:
+    """「指摘しない語」だけを直す指摘か（直す部分が指摘しない語に含まれる、または指摘しない語そのもの）"""
+    if not words:
+        return False
+    if f.after:
+        s, e, new = minimal_edit(f.before, f.after)
+        old = f.before[s:e]
+        return any((old and old in w) or (new and new in w) or w == norm(f.before) for w in words)
+    return any(w == norm(f.before) for w in words)
+
+
 # 同じ語の重複（形態素解析）。例: 「のの」「装置装置」「受け取って受け取った」「貯留し貯留する」
 _PUNCT_DUP = {"、", "。", "，", "．"}
 _BETWEEN_OK = ("助動詞", "助詞,接続助詞")
@@ -414,27 +620,37 @@ def hyoki_checks(paras: list[Para]) -> list[Finding]:
 OCR_URL = os.environ.get("PROOF_OCR_URL", "http://43279715.shared.olares.com")  # PaddleOCR の共有エントランス
 
 
-def ocr_pdf_text(pdf_path) -> str | None:
-    """PaddleOCR（layout-parsing API）で図面PDFの全ページの文字を読む。使えなければ None。"""
+def ocr_pages(data: bytes, file_type: int) -> list[str]:
+    """PaddleOCR（layout-parsing API）でファイルの文字を読み、ページごとの文字列を返す。
+    file_type: 0 = PDF、1 = 画像。使えなければ例外"""
     if not OCR_URL:
-        return None
+        raise RuntimeError("OCR の URL が未設定です")
     import base64
-    data = base64.b64encode(open(pdf_path, "rb").read()).decode()
-    body = json.dumps({"file": data, "fileType": 0, "useLayoutDetection": False,
+    body = json.dumps({"file": base64.b64encode(data).decode(), "fileType": file_type, "useLayoutDetection": False,
                        "useChartRecognition": False, "visualize": False}).encode()
+    last = None
     for path in ("/layout-parsing", "/api/layout-parsing"):
         try:
             req = urllib.request.Request(OCR_URL.rstrip("/") + path, data=body, headers={"Content-Type": "application/json"})
             with urllib.request.urlopen(req, timeout=900) as r:
                 res = json.loads(r.read())
-            pages = res["result"]["layoutParsingResults"]
-            text = "\n".join(b.get("block_content", "") for pg in pages for b in pg["prunedResult"]["parsing_res_list"])
-            log(f"図面PDF: OCR で {len(pages)} ページ / {len(text)} 文字を読み取り")
-            return text
+            return ["\n".join(b.get("block_content", "") for b in pg["prunedResult"]["parsing_res_list"])
+                    for pg in res["result"]["layoutParsingResults"]]
         except Exception as e:
             last = e
-    log(f"図面PDF: OCR に接続できません（{OCR_URL}: {last}）")
-    return None
+    raise RuntimeError(f"OCR に接続できません（{OCR_URL}: {last}）")
+
+
+def ocr_pdf_text(pdf_path) -> str | None:
+    """図面PDFの全ページの文字を OCR で読む。使えなければ None。"""
+    try:
+        pages = ocr_pages(open(pdf_path, "rb").read(), 0)
+    except Exception as e:
+        log(f"図面PDF: {e}")
+        return None
+    text = "\n".join(pages)
+    log(f"図面PDF: OCR で {len(pages)} ページ / {len(text)} 文字を読み取り")
+    return text
 
 
 def ocr_cache_path(pdf_path) -> Path:
@@ -569,18 +785,19 @@ class LLM:
 
 LINE_FORMAT = "段落番号｜修正前（原文から該当箇所を含む10〜30字をそのまま引用）｜修正後｜種類（タイポ／不自然な表現／用語の不統一／図面・符号との一致）｜備考（迷う場合は「要確認」と理由）"
 
-def _sys_view(name: str, what: str, scope: str) -> str:
+def _sys_view(name: str, what: str, scope: str, manual: str | None = None) -> str:
+    manual = MANUAL if manual is None else manual
     return f"""あなたは特許明細書の事務校正担当者です。下の校正方針に従い、{scope}について「{name}」の観点だけを確認してください。
 
 ## 校正方針
-{MANUAL}
+{manual}
 
 ## 今回確認する観点: {name}
 {what}
 
 ## 出力
 1行に1件、次の形式だけを書く（表や前置きは書かない）。該当がなければ「なし」。
-{LINE_FORMAT}"""
+{LINE_FORMAT}{_cite_rule(manual)}"""
 
 
 # 観点ごとの確認（文書全体の整合を見る観点は全文、局所的な観点は区切りごと）
@@ -594,11 +811,12 @@ VIEWS_LOCAL = [
     ("口語的・明らかに不自然な表現", "口語的な表現や、日本語として明らかに不自然で説明できる箇所がないか。"),
 ]
 
-def sys_verify() -> str:
+def sys_verify(manual: str | None = None) -> str:
+    manual = MANUAL if manual is None else manual
     return f"""あなたは特許明細書の事務校正の2次チェック担当です。1次チェックの候補を1件ずつ検証し、採用するか判定してください。
 
 ## 校正方針
-{MANUAL}
+{manual}
 
 ## 判定基準
 - 採用: 原文が実際にその通り書かれており、校正方針の確認項目に当たる誤りだと説明できる。
@@ -644,11 +862,11 @@ def rows_to_findings(rows, source: str) -> list[Finding]:
     return out
 
 
-def _verify(llm: LLM, text: str, cands: list[Finding]) -> list[Finding]:
+def _verify(llm: LLM, text: str, cands: list[Finding], manual: str | None = None) -> list[Finding]:
     if not cands:
         return []
     listing = "\n".join(f"{i}｜{c.label}｜{c.before}｜{c.after}｜{c.note}" for i, c in enumerate(cands, 1))
-    ver = parse_lines(llm.chat(sys_verify(), f"## 本文\n{text}\n\n## 1次チェックの候補\n{listing}"))
+    ver = parse_lines(llm.chat(sys_verify(manual), f"## 本文\n{text}\n\n## 1次チェックの候補\n{listing}"))
     verdict = {}
     for c in ver:
         num = re.sub(r"\D", "", c[0].translate(str.maketrans("０１２３４５６７８９", "0123456789")))
@@ -708,8 +926,9 @@ def llm_vote(llm: LLM, paras: list[Para], seg_chars: int):
             for run in range(VOTE_RUNS):
                 tasks.append((run, f"全文「{name}」", _sys_view(name, what, "明細書全体"), full, "llm-whole"))
     for name, what in VIEWS_LOCAL:
-        system = _sys_view(name, what, "渡された本文の一部")
         for gi in range(len(groups)):
+            # マニュアルの検索を使うときは、区切りごとに関係する項目だけを校正方針として渡す
+            system = _sys_view(name, what, "渡された本文の一部", manual_for(gi))
             for run in range(VOTE_RUNS):
                 tasks.append((run, f"区切り{gi + 1}「{name}」", system, "## 本文\n" + gtext[gi], "llm-seg"))
     done = [0]
@@ -767,7 +986,7 @@ def llm_verify(llm: LLM, single: dict[int, list[Finding]], gtext: list[str]) -> 
 
     def verify_group(item):
         gi, lst = item
-        return _verify(llm, gtext[gi], lst)
+        return _verify(llm, gtext[gi], lst, manual_for(gi))
 
     out: list[Finding] = []
     with ThreadPoolExecutor(PARALLEL) as ex:
@@ -970,6 +1189,13 @@ def apply_to_docx(doc, findings: list[Finding]):
                 done = tracked_replace(p, bi + s, bi + e, new, date)
                 if done:
                     f.applied = "change"
+                    basis = [l for l in f.note.splitlines() if CITE_RE.search(l)]
+                    if basis:  # 校正方針の項目に基づく修正は、変更履歴の位置に根拠のコメントも付ける
+                        t2 = p.text
+                        at = min(bi + s, max(len(t2) - 1, 0))
+                        runs = isolate(p, at, at + 1) or [r for r in p.runs if r.text][:1]
+                        if runs:
+                            doc.add_comment(runs, text="【根拠】" + "\n".join(basis), author=AUTHOR, initials="AI")
         if not done:
             end = bi + len(f.before) if text.find(f.before) >= 0 else min(len(text), bi + 10)
             runs = isolate(p, bi, end) or [r for r in p.runs if r.text][:1]

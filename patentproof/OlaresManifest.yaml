@@ -10,7 +10,7 @@ metadata:
   title: Patent Proofreader
   description: Proofread Japanese patent specifications (.docx) with rules and a local LLM, saving results as tracked changes and comments
   icon: https://raw.githubusercontent.com/ryosk7/olares-patentproof/main/icon.png
-  version: 1.0.4
+  version: 1.0.5
   categories:
   - Utilities_v112
 
@@ -52,7 +52,7 @@ envs:
   description: "Shared entrance URL of PaddleOCR for drawing checks. Leave empty to skip drawing checks."
 
 spec:
-  versionName: '1.0.4'
+  versionName: '1.0.5'
   fullDescription: |
     Proofreads Japanese patent specifications (.docx) in Home/Documents. A local LLM checks each category
     (typos and mis-conversions, inconsistent terms, notation variants, colloquial wording, reference-numeral mismatches)

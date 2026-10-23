@@ -50,14 +50,13 @@ Values saved on the app's Settings page take precedence.
    - Or click 「ファイルを追加」 (Add files) in the app and choose them, or drag & drop them anywhere on the page. They are saved to `Home/Documents/アップロード/<specification name>/` (files with the same name are overwritten)
 2. Click **「校正」 (Proofread)**. About 30 minutes for 20,000 characters (estimated from earlier run logs)
    - If the drawing has not been read yet, start PaddleOCR first. The drawing is read with OCR and saved as `<drawing PDF name>_OCR.txt`
-   - After that, the job waits with 「PaddleOCR の停止待ち」 (waiting for PaddleOCR to stop). **Stop PaddleOCR** and the LLM steps start automatically
    - 「ルールのみ」 (rules only) runs just the mechanical checks and drawing matching, in a few seconds
 3. A running job can be stopped with 「中止」 (Stop)
 4. When finished, open `【AI校正】….docx` in the same folder with Word or OnlyOffice and review the tracked changes and comments
    - You can also download the result with 「結果」 (Result) in the list, or the .docx and CSV from the job's detail page
 
 > **GPU note**: running the LLM and OCR at the same time can exhaust GPU/memory and stop the LLM.
-> The app never calls the LLM while PaddleOCR is running: it checks before every LLM call and waits until PaddleOCR is stopped.
+> The app runs OCR, embedding and LLM calls one step at a time, so they never overlap; once OCR finishes, the next step starts. PaddleOCR does not need to be stopped.
 
 ## Accuracy (for reference)
 
@@ -76,9 +75,31 @@ Always have a person do the final review.
 
 ### Dataset (proofreading manuals)
 
-Manage your firm's proofreading manuals on the 「データセット」 (Dataset) page: add them by choosing files or drag & drop (.txt / .md / .docx / .pdf), edit, download, turn on/off, or delete.
-Importing a file with the same name updates it. Manuals that are on are joined into the proofreading policy used in every LLM check; with none on, the built-in policy is used.
-A policy written on the Settings page in older versions is moved here automatically. Long manuals slow down every LLM call, so keep only what matters for proofreading.
+Manage your firm's proofreading manuals on the 「データセット」 (Dataset) page.
+- Add them by choosing files or drag & drop (.txt / .md / .docx / .pdf / .png / .jpg). You can also edit, download, turn on/off or delete them.
+- Importing a file with the same name updates it.
+- With no manual on, the built-in policy is used. A policy written on the Settings page in older versions is moved here automatically.
+
+When a manual is added, it is processed in two stages:
+1. Right away, on the CPU: the text is extracted and split into chunks numbered like ［M1-3］, and rules written in a recognizable form are read out. Recognized forms include 「行なう → 行う」, 「「予め」は「あらかじめ」とする」, ×／○ and 誤／正 tables, 「「等」は使わない」 and 「「及び」は指摘しない」.
+2. In the background, one task at a time in the same queue as proofreading, so it never shares the GPU with a running check:
+   - images inside .docx files, scanned PDF pages and image files are read with PaddleOCR, a few pages at a time;
+   - embeddings are computed;
+   - the LLM reads further rules from free-form text: replacements, words not to use, regular expressions, words to never flag, words that are not reference numerals, and prefixes before component names.
+
+Each manual's chunks and rules can be viewed on the Dataset page, and each rule can be turned on or off.
+
+During proofreading:
+- **Rules**: rules are applied mechanically. Findings from LLM-read rules are marked 【要確認】. Unsafe regular expressions are rejected.
+- **Passing the manual to the LLM**: manuals up to 8,000 characters are passed whole. Longer ones are searched with an embedding model, and only the most relevant items are passed for each passage.
+- **Citations**: findings cite the manual item they are based on, e.g. 根拠［M1-3］. This shows as a tooltip on the results page and as the item's opening text in .docx comments and the CSV.
+
+| Setting | Default | Description |
+|---|---|---|
+| How the manual is passed | Auto | Auto (whole up to 8,000 characters, search above) / always whole / always search |
+| Embedding model | Auto | A small embedding model from the LLM's model list (gemma-based preferred) |
+| Items passed per passage | 6 | Used when searching |
+| Rule reading (LLM) | On | Off reads only rules written in a recognizable form |
 
 ## Environment
 

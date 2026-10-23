@@ -22,16 +22,28 @@ server.py の worker が工程（`STEPS`）を1つずつ実行し、工程ごと
 5. LLM 検証 `llm_verify`: 1票のものを `sys_verify()` で検証する。2票以上は採用
 6. 書き出し `apply_to_docx`: 全回一致の小さな修正は変更履歴、それ以外は【要確認】コメントとして書き込み、CSV も出す
 
-GPU の取り合い対策: `proofread.BEFORE_CALL` に `gpu_gate` を入れ、LLM を呼ぶ前に PaddleOCR の /health を確かめる。動いていれば「PaddleOCR の停止待ち」にして止まるまで待つ。中止（/cancel/<id>）もここで反映する。
+GPU の取り合い対策: OCR・埋め込み・LLM はどれも1本のワーカーが工程の順に呼ぶので、処理が重ならない。OCR の処理が終われば次の工程に進む（PaddleOCR のアプリを止める必要はない）。`proofread.BEFORE_CALL` の `gpu_gate` では中止（/cancel/<id>）を反映する。
 LLM の呼び出しごとの秒数・トークン数・finish_reason は `LLM.stats` に記録し、ログに `LLM.summary()` を出す（ボトルネックの確認用）。
 
-校正方針は `DEFAULT_MANUAL`。「データセット」画面（APP_DATA/dataset の index.json と <id>.txt）で使用オンのマニュアルがあればそれをつなげて使い、`_sys_view` と `sys_verify()` の両方に入る。旧版の設定画面の校正方針は初回にデータセットへ移す。`PROOF_MANUAL_FILE` でも差し替えられる。
+校正方針は `DEFAULT_MANUAL`。「データセット」画面で使用オンのマニュアルがあればそれを使い、`_sys_view` と `sys_verify()` の両方に入る。旧版の設定画面の校正方針は初回にデータセットへ移す。`PROOF_MANUAL_FILE` でも差し替えられる。
+
+## データセット（マニュアル）
+- 保存先は APP_DATA/dataset：index.json（一覧）、`<id>.txt`（本文）、`<id>.chunks.json`（チャンクと埋め込み）、`<id>.rules.json`（ルール）、`<id>.orig.<拡張子>`（元ファイル）
+- 取り込みは2段階。アップロード時は `ds_ingest` で CPU の処理だけ（文字の取り出し・`chunk_text`・書式からのルール読み取り）をしてすぐ返す。GPU の処理は `run_ds_task` を校正と同じワーカーのキューに入れ、1件ずつ行う
+  - 順序：画像の OCR（PaddleOCR が動いているときだけ。PDF は文字のないページを `OCR_PAGES` ずつ）→ 埋め込み（`EMBED_BATCH` ずつ）→ LLM でのルール読み取り（`llm_manual_rules`）
+- チャンクには項目番号（［M1-3］）を振る。校正では、使用中のマニュアルが `MANUAL_WARN_CHARS` 字以下なら全文、超えたら区切りごとに埋め込みで近い `top_k` 項目だけを `MANUAL_FOR` で渡す（設定で全文・検索に固定できる）
+- 指摘の備考に根拠の項目番号を書かせ、結果画面ではツールチップ、docx のコメントと CSV では項目の冒頭を添える。根拠つきで変更履歴にした修正には【根拠】コメントも付ける
+- ルール（`RULE_TYPES`）：replace / forbid / regex / ignore / symbol_exclude / symbol_prefix
+  - 書式からは `parse_manual_rules` で読み取る（矢印、かぎ括弧の「とする」「ではなく」「使わない」「指摘しない」、誤／正の表）
+  - LLM からは `llm_manual_rules` で読み取る。LLM が読み取ったルールの指摘は要確認にする
+  - `validate_rule` で、入れ子の繰り返しや何にでも当たる正規表現をはじく
+  - 校正では `manual_rule_checks` で当てはめ、symbol_exclude / symbol_prefix は `configure_symbols` で符号の抽出に足し、ignore は `is_ignored` で指摘を外す
 
 ## 守ること
 - **事務所の校正マニュアルの文面や例をコードやリポジトリに入れない**。既定の方針は一般的な内容だけにする
 - **評価用の正解データ（解答ファイル）の内容を、プロンプト、ルール、ナレッジに使わない**。正解は採点にだけ使う
 - **特定の検証用文書の取りこぼしに合わせた個別ルールを足さない**。改善は汎用的なもの、または校正方針に基づくものに限る
-- **LLM（Qwen）と PaddleOCR を同時に動かさない**。GPU／メモリが足りず LLM が落ちる。OCR は LLM の工程より前に済ませ、LLM の工程は `gpu_gate` で PaddleOCR の停止を待ってから始める
+- **LLM（Qwen）と PaddleOCR の処理を重ねない**。GPU／メモリが足りず LLM が落ちる。OCR は LLM の工程より前に済ませ、OCR が終わってから次の工程に進む（ワーカー1本で順番に呼ぶ）
 
 ## リリース手順
 1. `Chart.yaml` の version と、`OlaresManifest.yaml` の `metadata.version` / `spec.versionName` を上げる
