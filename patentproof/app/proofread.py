@@ -9,8 +9,9 @@
 出力（入力と同じフォルダ）:
     【AI校正】明細書.docx      … 変更履歴（明確な誤記）とコメント（要確認・申し送り）付き
     明細書_修正箇所一覧.csv    … 全指摘の一覧
+    明細書_符号対応表.csv      … 名称と符号の対応表（矛盾の種類つき）
 
-依存: python-docx (pip install python-docx)
+依存: python-docx、janome（語の重複チェック。なければ省略）、pypdf（図面照合）
 """
 from __future__ import annotations
 
@@ -95,7 +96,7 @@ LABEL_RE = re.compile(r"^【([^】]+)】")
 
 
 def is_para_label(inner: str) -> bool:
-    return bool(re.fullmatch(f"[{FW_DIGIT}]+", inner) or inner.startswith("請求項") or inner.startswith("図"))
+    return bool(re.fullmatch(f"[{FW_DIGIT}]+", inner) or inner.startswith("請求項") or inner.startswith("図") or inner == "符号の説明")
 
 
 def extract_paragraphs(doc) -> list[Para]:
@@ -120,56 +121,252 @@ def extract_paragraphs(doc) -> list[Para]:
 
 
 # ---------------------------------------------------------------------------
-# 2. ルールチェック（符号・図番号・ステップ・語句の重複）
+# 2. ルールチェック（名称と符号の対応表・語の重複・表記ゆれ）
 # ---------------------------------------------------------------------------
 NUM_RE = re.compile(rf"([ァ-ヶー一-龠々]{{2,}})([{FW_DIGIT}]{{1,4}}[{FW_UPPER}]?)(?![{FW_DIGIT}．{FW_UPPER}])")
 PREFIX_RE = re.compile(r"^(前記|上記|当該|該|各|及び|又は|並びに|若しくは)+")
-EXCLUDE_TERM = re.compile(r"(請求項|特許第|第|図|段落|ステップ|文献|番号|工程)$")
+# 符号ではない「語＋数字」（文献番号・請求項・図番号・日付・式番号など）
+EXCLUDE_TERM = re.compile(r"(請求項|特許第|第|図|段落|ステップ|文献|番号|工程|特開|特表|再表|特願|実開|実願|国際公開|公報|式|数|表|頁|年|月|日)$")
+# 【符号の説明】の1項目（例: １０…撹拌装置 / １０　撹拌装置 / 10：撹拌装置）
+LEGEND_RE = re.compile(rf"(?<![{FW_DIGIT}0-9])([{FW_DIGIT}0-9]{{1,4}}[{FW_UPPER}A-Z]?)\s*(?:…+|‥+|：|:|－|-|\s)+\s*([^\s、，,…‥：:{FW_DIGIT}0-9][^\s、，,…‥：:]*)")
+Z2H = str.maketrans("０１２３４５６７８９ＡＢＣＤＥＦＧＨＩＪＫＬＭＮＯＰＱＲＳＴＵＶＷＸＹＺ", "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ")
 
 
 def ctx(text: str, start: int, end: int, pad: int = 8) -> str:
     return text[max(0, start - pad): end + pad]
 
 
-def rule_checks(paras: list[Para]) -> list[Finding]:
-    out: list[Finding] = []
-    occ = []  # (term, num, para, start, end)
+def is_legend(p: Para) -> bool:
+    return p.label == "【符号の説明】" or "…" in p.text
+
+
+def symbol_occurrences(paras: list[Para]) -> list[tuple]:
+    """本文中の「名称＋符号」を拾う。(名称, 符号(全角のまま), 段落, 名称の開始位置, 終了位置)"""
+    occ = []
     for p in paras:
-        if p.label == "【符号の説明】" or "…" in p.text:
+        if is_legend(p):
             continue
         for m in NUM_RE.finditer(p.text):
             term = PREFIX_RE.sub("", m.group(1))
             if len(term) < 2 or EXCLUDE_TERM.search(term):
                 continue
             occ.append((term, m.group(2), p, m.start(1) + (len(m.group(1)) - len(term)), m.end()))
+    return occ
 
-    by_num: dict[str, list] = {}
-    for o in occ:
-        by_num.setdefault(o[1], []).append(o)
 
-    # R1a 同じ符号に別の名称
-    for num, lst in by_num.items():
-        cnt: dict[str, int] = {}
-        for o in lst:
-            cnt[o[0]] = cnt.get(o[0], 0) + 1
-        main = max(cnt, key=cnt.get)
-        for term in cnt:
-            if term == main or main.endswith(term) or term.endswith(main):
+def legend_entries(paras: list[Para]) -> dict[str, tuple]:
+    """【符号の説明】の 符号(半角) → (名称, 段落, 位置, 符号の表記)"""
+    out: dict[str, tuple] = {}
+    for p in paras:
+        if not is_legend(p):
+            continue
+        for m in LEGEND_RE.finditer(p.text):
+            name = PREFIX_RE.sub("", m.group(2))
+            if len(name) >= 2:
+                out.setdefault(m.group(1).translate(Z2H), (name, p, m.start(2), m.group(1)))
+    return out
+
+
+def _related(a: str, b: str) -> bool:
+    """同じものを指すとみなす名称（一方が他方の末尾・先頭に含まれる。例: 羽根 / 撹拌羽根）"""
+    return a == b or a.endswith(b) or b.endswith(a) or a.startswith(b) or b.startswith(a)
+
+
+def _digit_slip(a: str, b: str) -> bool:
+    """符号の打ち間違いらしい差（数字の脱落・重複・入れ替わり）。末尾1桁だけの違いは兄弟の符号とみなして除く"""
+    if abs(len(a) - len(b)) == 1:
+        long, short = (a, b) if len(a) > len(b) else (b, a)
+        return any(long[:i] + long[i + 1:] == short for i in range(len(long)))
+    if len(a) == len(b) and len(a) >= 2:
+        d = [i for i in range(len(a)) if a[i] != b[i]]
+        return len(d) == 2 and d[1] == d[0] + 1 and a[d[0]] == b[d[1]] and a[d[1]] == b[d[0]]
+    return False
+
+
+def symbol_table(paras: list[Para]) -> dict[str, dict]:
+    """名称と符号の対応表。符号(半角) → {fw: 全角表記, names: {名称: 回数}, occ: [...], legend: (名称, 段落, 位置) or None}"""
+    table: dict[str, dict] = {}
+    for o in symbol_occurrences(paras):
+        e = table.setdefault(o[1].translate(Z2H), {"fw": o[1], "names": {}, "occ": [], "legend": None, "fig": None, "issues": []})
+        e["names"][o[0]] = e["names"].get(o[0], 0) + 1
+        e["occ"].append(o)
+    for num, ent in legend_entries(paras).items():
+        table.setdefault(num, {"fw": ent[3], "names": {}, "occ": [], "legend": None, "fig": None, "issues": []})["legend"] = ent
+    return table
+
+
+def symbol_checks(paras: list[Para], table: dict[str, dict]) -> list[Finding]:
+    """対応表の矛盾を探す。
+    R1a 同じ符号に別の名称 / R1b 1回しか出ない符号 / R1c 同じ名称で数字の打ち間違いらしい符号 /
+    R1d 【符号の説明】と本文の名称の食い違い / R1e 【符号の説明】と本文の過不足"""
+    out: list[Finding] = []
+
+    def add(ent, o, after, kind, note, tag):
+        term, fw, p, s, e = o
+        ent["issues"].append(tag)
+        out.append(Finding("rule", p.label, term + fw, after, kind, note, p.idx, s, needs_check=True))
+
+    has_legend = sum(1 for e in table.values() if e["legend"]) >= 3
+    by_name: dict[str, dict[str, int]] = {}
+    for num, ent in table.items():
+        for term, n in ent["names"].items():
+            by_name.setdefault(term, {})[num] = n
+
+    for num, ent in table.items():
+        cnt, lst = ent["names"], ent["occ"]
+        if cnt:
+            # R1a
+            main = max(cnt, key=cnt.get)
+            for term in cnt:
+                if not _related(term, main):
+                    o = next(x for x in lst if x[0] == term)
+                    add(ent, o, main + ent["fw"], "用語の不統一", f"符号{ent['fw']}は他の箇所では「{main}」（{cnt[main]}回）。", "名称の食い違い")
+            # R1c
+            for term, n in cnt.items():
+                if n > 2:
+                    continue
+                syms = by_name.get(term, {})
+                if len(syms) > 3:  # 同じ名称に符号が多い（流路１３０１〜１３０６ など）は連番とみなす
+                    continue
+                for other, m in syms.items():
+                    if other != num and m >= 3 and _digit_slip(num, other) and not (ent["legend"] and _related(ent["legend"][0], term)):
+                        o = next(x for x in lst if x[0] == term)
+                        add(ent, o, term + table[other]["fw"], "図面・符号との一致",
+                            f"「{term}」の符号は他の箇所では「{table[other]['fw']}」（{m}回）。数字の打ち間違いの可能性。", "符号の打ち間違い？")
+                        break
+            # R1d
+            if ent["legend"]:
+                lname = ent["legend"][0]
+                for term in cnt:
+                    if not _related(term, lname):
+                        o = next(x for x in lst if x[0] == term)
+                        add(ent, o, lname + ent["fw"], "図面・符号との一致", f"【符号の説明】では符号{ent['fw']}は「{lname}」。", "符号の説明と不一致")
+            # R1b / R1e（本文にあって符号の説明にない）。上で矛盾を指摘済みの符号には重ねない
+            if ent["issues"]:
+                pass
+            elif len(lst) == 1 and not ent["legend"]:
+                add(ent, lst[0], "", "図面・符号との一致",
+                    f"符号「{lst[0][0]}{ent['fw']}」は文書中この1回しか出てこない。他に説明のない符号の可能性。", "1回だけ")
+            elif has_legend and not ent["legend"]:
+                add(ent, lst[0], "", "図面・符号との一致", f"符号「{lst[0][0]}{ent['fw']}」が【符号の説明】にない。", "符号の説明にない")
+        elif ent["legend"]:
+            # R1e（符号の説明にあって本文にない）
+            name, p, i, _ = ent["legend"]
+            ent["issues"].append("本文に出てこない")
+            out.append(Finding("rule", p.label, name, "", "図面・符号との一致",
+                               f"【符号の説明】の符号{ent['fw']}「{name}」が本文に出てこない。", p.idx, i, needs_check=True))
+    return out
+
+
+def table_rows(table: dict[str, dict]) -> list[list[str]]:
+    """対応表を CSV・画面用の行にする（符号の数字順）"""
+    def key(k):
+        m = re.match(r"(\d+)(.*)", k)
+        return (int(m.group(1)), m.group(2)) if m else (10 ** 6, k)
+    rows = []
+    for num in sorted(table, key=key):
+        e = table[num]
+        names = "、".join(f"{t}（{n}）" for t, n in sorted(e["names"].items(), key=lambda x: -x[1]))
+        first = e["occ"][0][2].label if e["occ"] else (e["legend"][1].label if e["legend"] else "")
+        fig = {True: "○", False: "×", None: "—"}[e["fig"]]
+        rows.append([e["fw"], names, e["legend"][0] if e["legend"] else "", first, fig, "、".join(dict.fromkeys(e["issues"]))])
+    return rows
+
+
+def rule_checks(paras: list[Para], table: dict[str, dict] | None = None) -> list[Finding]:
+    if table is None:
+        table = symbol_table(paras)
+    return symbol_checks(paras, table) + hyoki_checks(paras) + repeat_checks(paras)
+
+
+# 同じ語の重複（形態素解析）。例: 「のの」「装置装置」「受け取って受け取った」「貯留し貯留する」
+_PUNCT_DUP = {"、", "。", "，", "．"}
+_BETWEEN_OK = ("助動詞", "助詞,接続助詞")
+
+
+def _pos(t) -> str:
+    return t.part_of_speech
+
+
+def morph_tokens(text: str, tk) -> list[tuple[str, str, str, int]]:
+    """(表層, 品詞, 原形, 開始位置)"""
+    out, pos = [], 0
+    for t in tk.tokenize(text):
+        i = text.find(t.surface, pos)
+        i = pos if i < 0 else i
+        out.append((t.surface, t.part_of_speech, t.base_form, i))
+        pos = i + len(t.surface)
+    return out
+
+
+def _skip_unit(unit) -> bool:
+    surf = "".join(u[0] for u in unit)
+    if not surf.strip():
+        return True
+    if all(u[1].startswith("記号") for u in unit):
+        return surf not in _PUNCT_DUP  # 「、、」「。。」だけを見る（記号の繰り返しは数式などで正当なことがある）
+    if any(u[1].startswith("名詞,数") or u[1].startswith("記号,アルファベット") for u in unit):
+        return True
+    # 漢字・カタカナ1字の名詞の繰り返し（「人人」など）は除く。ひらがな1字（「のの」「をを」）は誤記として見る
+    return len(unit) == 1 and len(surf) == 1 and unit[0][1].startswith("名詞") and not re.fullmatch(r"[ぁ-ん]", surf)
+
+
+def repeat_checks(paras: list[Para]) -> list[Finding]:
+    out: list[Finding] = []
+    # 同じ文が続けて2回（正規表現。形態素解析が使えなくても動く）
+    for p in paras:
+        for m in re.finditer(r"([^。]{6,}。)\1", p.text):
+            out.append(Finding("rule", p.label, m.group(0), m.group(1), "タイポ", "同じ文が続けて2回書かれている。", p.idx, m.start()))
+    try:
+        from janome.tokenizer import Tokenizer
+    except ImportError:
+        log("形態素解析（janome）が使えないため、語の重複チェックは同じ文の繰り返しだけ行います")
+        return out
+    tk = Tokenizer()
+    for p in paras:
+        toks = morph_tokens(p.text, tk)
+        i = 0
+        while i < len(toks):
+            hit = None
+            # A: 同じ語（1〜6語の並び）がそのまま続く
+            for n in range(min(6, (len(toks) - i) // 2), 0, -1):
+                unit, nxt = toks[i:i + n], toks[i + n:i + 2 * n]
+                if [u[0] for u in unit] == [u[0] for u in nxt] and not _skip_unit(unit):
+                    s, e = unit[0][3], nxt[-1][3] + len(nxt[-1][0])
+                    word = p.text[s:unit[-1][3] + len(unit[-1][0])]
+                    kana_word = bool(re.fullmatch(r"[ぁ-んァ-ヶー]{2,}", word)) and not unit[0][1].startswith(("助詞", "助動詞"))
+                    a, b = max(0, s - 4), min(len(p.text), e + 4)
+                    hit = Finding("rule", p.label, p.text[a:b], p.text[a:s] + word + p.text[e:b], "タイポ",
+                                  f"語の重複（形態素解析）: 「{word}」が続けて2回出ている。" + (" 要確認" if kana_word else ""),
+                                  p.idx, a, needs_check=kana_word)
+                    i += 2 * n
+                    break
+            if hit:
+                out.append(hit)
                 continue
-            for o in (x for x in lst if x[0] == term):
-                p = o[2]
-                out.append(Finding("rule", p.label, term + num, main + num, "用語の不統一",
-                                   f"符号{num}は他の箇所では「{main}」（{cnt[main]}回）。", p.idx, o[3], needs_check=True))
-
-    # R1b 文書中1回しか出ない符号（符号の説明に載っていれば除外）
-    sym_text = "".join(p.text for p in paras if p.label == "【符号の説明】" or "…" in p.text)
-    for num, lst in by_num.items():
-        if len(lst) == 1 and not re.search(rf"(?<![{FW_DIGIT}]){num}(?![{FW_DIGIT}])", sym_text):
-            term, _, p, s, e = lst[0]
-            out.append(Finding("rule", p.label, term + num, "", "図面・符号との一致",
-                               f"符号「{term}{num}」は文書中この1回しか出てこない。他に説明のない符号の可能性。", p.idx, s, needs_check=True))
-
-    out += hyoki_checks(paras)
+            # B: 同じ自立語が活用語尾・接続助詞だけを挟んで繰り返される（「貯留し貯留する」「受け取って受け取った」）
+            t = toks[i]
+            if (t[1].startswith("動詞,自立") or (t[1].startswith("名詞") and not t[1].startswith(("名詞,数", "名詞,非自立", "名詞,代名詞", "名詞,接尾")))) \
+                    and len(t[0]) >= 2:
+                for j in range(i + 1, min(i + 4, len(toks))):
+                    u = toks[j]
+                    if u[2] == t[2] and u[1].split(",")[0] == t[1].split(",")[0]:
+                        between = toks[i + 1:j]
+                        follow = toks[j + 1] if j + 1 < len(toks) else None
+                        # 「記憶する記憶部」「取得する取得部」のように後ろが名詞につながる形は特許の定型表現なので除く
+                        if between and all(b[1].startswith(_BETWEEN_OK) or b[2] == "する" for b in between) \
+                                and not (follow and follow[1].startswith("名詞")):
+                            s, e = t[3], u[3] + len(u[0])
+                            a, b = max(0, s - 4), min(len(p.text), e + 6)
+                            out.append(Finding("rule", p.label, p.text[a:b], "", "タイポ",
+                                               f"語の重複（形態素解析）: 「{t[2]}」が続けて出ている。どちらかが不要の可能性。 要確認",
+                                               p.idx, a, needs_check=True))
+                            i = j
+                        break
+                    if not (u[1].startswith(_BETWEEN_OK) or u[2] == "する"):
+                        break
+            i += 1
+    del tk
     return out
 
 
@@ -245,13 +442,14 @@ def ocr_cache_path(pdf_path) -> Path:
     return p.with_name(p.stem + "_OCR.txt")
 
 
-def drawing_symbol_checks(paras: list[Para], pdf_path, allow_ocr: bool = True) -> list[Finding]:
-    """明細書に出てくる符号が図面PDFの文字にあるかを照合し、見つからない符号を申し送る。"""
+def drawing_symbol_checks(paras: list[Para], pdf_path, allow_ocr: bool = True, table: dict | None = None) -> list[Finding]:
+    """明細書に出てくる符号が図面PDFの文字にあるかを照合し、見つからない符号を申し送る。
+    allow_ocr=True なら OCR で読み直す。False なら保存済みの OCR 結果を使う（なければ PDF 内の文字情報）。"""
     out: list[Finding] = []
     cache = ocr_cache_path(pdf_path)
     text = None
     if allow_ocr:
-        # OCR は GPU を使うため、LLM（Qwen）と同時に動かさない。ルールのみ実行のときに読み取り、結果を保存しておく
+        # OCR は GPU を使うため、LLM（Qwen）と同時に動かさない。呼び出し側が LLM の工程より前に済ませる
         text = ocr_pdf_text(pdf_path)
         if text is not None:
             cache.write_text(text, encoding="utf-8")
@@ -259,9 +457,6 @@ def drawing_symbol_checks(paras: list[Para], pdf_path, allow_ocr: bool = True) -
     elif cache.exists():
         text = cache.read_text(encoding="utf-8")
         log(f"図面PDF: 保存済みの OCR 結果（{cache.name}）を使用")
-    else:
-        log("図面PDF: OCR 結果がまだありません（先に「ルールのみ」を実行すると図面を OCR で読み取ります）")
-        return out
     if text is None:
         try:
             from pypdf import PdfReader
@@ -270,23 +465,24 @@ def drawing_symbol_checks(paras: list[Para], pdf_path, allow_ocr: bool = True) -
         except Exception as e:
             log(f"図面PDFを読めないため符号照合をスキップ（{e}）")
             return out
-    z2h = str.maketrans("０１２３４５６７８９ＡＢＣＤＥＦＧＨＩＪＫＬＭＮＯＰＱＲＳＴＵＶＷＸＹＺ", "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ")
-    fig_syms = set(re.findall(r"(?<![0-9A-Za-z.])(\d{1,4}[A-Z]?)(?![0-9A-Za-z.])", text.translate(z2h)))
+    fig_syms = set(re.findall(r"(?<![0-9A-Za-z.])(\d{1,4}[A-Z]?)(?![0-9A-Za-z.])", text.translate(Z2H)))
     if not fig_syms:
         log("図面PDFに文字情報がないため符号照合をスキップ")
         return out
-    spec_syms = {}
-    for p in paras:
-        for m in NUM_RE.finditer(p.text):
-            spec_syms.setdefault(m.group(2).translate(z2h), (m.group(1), m.group(2), p, m.start()))
-    figs = {re.sub(r"\D", "", x) for x in re.findall(r"図\s*([0-9]+)", text.translate(z2h))}
+    if table is None:
+        table = symbol_table(paras)
+    # 対応表と同じ抽出（文献番号・請求項などは除く）を使う
+    spec_syms = {num: (e["occ"][0][0], e["fw"], e["occ"][0][2], e["occ"][0][3]) for num, e in table.items() if e["occ"]}
     # 明細書→図面の向きで照合（図面側の数字は目盛りなども含むため逆向きは使わない）
     missing = [(k, v) for k, v in spec_syms.items() if k not in fig_syms
                and "図示しない" not in v[2].text[max(0, v[3] - 15):v[3]]]
     if spec_syms and len(missing) > len(spec_syms) / 2:
         log(f"明細書の符号 {len(spec_syms)} 個のうち {len(missing)} 個が図面の文字に見つからず、図面PDFの文字が読めていないとみなして照合を省略")
         return out
+    for num in spec_syms:
+        table[num]["fig"] = num in fig_syms
     for num, (term, fw, p, i) in missing:
+        table[num]["issues"].append("図面にない")
         out.append(Finding("rule", p.label, term + fw, "", "図面・符号との一致",
                            f"符号「{term}{fw}」が図面（PDFの文字）に見つからない。 要確認", p.idx, i, needs_check=True))
     log(f"図面PDFの符号 {len(fig_syms)} 個と照合")
@@ -295,14 +491,40 @@ def drawing_symbol_checks(paras: list[Para], pdf_path, allow_ocr: bool = True) -
 # ---------------------------------------------------------------------------
 # 3. LLM
 # ---------------------------------------------------------------------------
+# LLM を呼ぶ直前に呼ばれる関数（アプリが「PaddleOCR が止まるまで待つ」「キャンセル」に使う）
+BEFORE_CALL = None
+
+
 class LLM:
     def __init__(self, base_url: str, model: str, api_key: str | None, verbose: bool):
         self.url = base_url.rstrip("/") + "/chat/completions"
         self.model, self.api_key, self.verbose = model, api_key, verbose
         self.calls = 0
+        self.stats: list[dict] = []  # 呼び出しごとの所要時間・トークン数（ボトルネックの確認用）
+
+    def short(self, since: int = 0) -> str:
+        st = self.stats[since:]
+        return f"{len(st)} 回 ・ 平均 {sum(x['secs'] for x in st) / len(st):.1f} 秒" if st else "呼び出しなし"
+
+    def summary(self, since: int = 0) -> str:
+        st = self.stats[since:]
+        if not st:
+            return "LLM 呼び出しなし"
+        secs = sum(x["secs"] for x in st)
+        pt = sum(x["prompt"] for x in st)
+        ct = sum(x["completion"] for x in st)
+        cut = sum(1 for x in st if x["finish"] == "length")
+        msg = f"{len(st)} 回 / 平均 {secs / len(st):.1f} 秒 / 入力 {pt:,} トークン / 出力 {ct:,} トークン"
+        if ct and secs:
+            msg += f"（出力 {ct / secs:.1f} トークン/秒・1本あたり）"
+        if cut:
+            msg += f" / 出力上限で切れた応答 {cut} 回"
+        return msg
 
     def chat(self, system: str, user: str, max_tokens: int = 4096, reasoning: str | None = None,
              temperature: float = 0.1, top_p: float = 0.3) -> str:
+        if BEFORE_CALL:
+            BEFORE_CALL()
         effort = REASONING if reasoning is None else reasoning
         body = json.dumps({
             "model": self.model,
@@ -316,12 +538,19 @@ class LLM:
         delay = 5
         for attempt in range(8):
             try:
+                t0 = time.time()
                 req = urllib.request.Request(self.url, data=body, headers=headers)
                 with urllib.request.urlopen(req, timeout=1800) as r:
                     data = json.loads(r.read())
                 self.calls += 1
-                text = data["choices"][0]["message"]["content"] or ""
-                return re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()
+                choice = data["choices"][0]
+                usage = data.get("usage") or {}
+                self.stats.append({"secs": time.time() - t0, "prompt": usage.get("prompt_tokens", 0),
+                                   "completion": usage.get("completion_tokens", 0), "finish": choice.get("finish_reason", "")})
+                text = re.sub(r"<think>.*?</think>", "", choice["message"]["content"] or "", flags=re.S).strip()
+                if choice.get("finish_reason") == "length" and not text:
+                    log(f"  LLM: 推論だけで出力上限（{max_tokens} トークン）に達し、回答が空でした")
+                return text
             except urllib.error.HTTPError as e:
                 msg = e.read().decode(errors="replace")[:300]
                 if e.code in (429, 500, 502, 503, 504):
@@ -442,14 +671,12 @@ def _verify(llm: LLM, text: str, cands: list[Finding]) -> list[Finding]:
 VOTE_RUNS = int(os.environ.get("PROOF_VOTE_RUNS", "3"))        # 同じ観点を何回実行するか
 PARALLEL = int(os.environ.get("PROOF_LLM_PARALLEL", "2"))        # LLM の同時実行数（ルーターの上限に合わせる）
 SAMPLE_TEMP = float(os.environ.get("PROOF_SAMPLE_TEMPERATURE", "0.7"))
+# 全文を渡す観点（VIEWS_WHOLE）を使うか。2万字級の明細書では1回1.5〜2分かかるのに指摘が0件だったため既定は off。
+# 用語の不統一・符号と名称・表記ゆれはルールチェック（対応表・形態素解析・カタカナ表記ゆれ）で機械的に見る
+WHOLE_VIEWS = os.environ.get("PROOF_WHOLE_VIEWS", "0") == "1"
 
 
-def llm_checks(llm: LLM, paras: list[Para], seg_chars: int) -> list[Finding]:
-    """観点別チェックを VOTE_RUNS 回ずつ（サンプリングを変えて）実行し、多数決でまとめる。
-    判定規則（事前に固定）: 2回以上検出 → 採用 / 1回だけ → 2次チェック（検証）で採用されたものだけ採用。"""
-    from concurrent.futures import ThreadPoolExecutor
-
-    full = "\n".join(p.text for p in paras)
+def segments(paras: list[Para], seg_chars: int) -> list[list[Para]]:
     groups, cur, n = [], [], 0
     for p in paras:
         if n + len(p.text) > seg_chars and cur:
@@ -459,16 +686,32 @@ def llm_checks(llm: LLM, paras: list[Para], seg_chars: int) -> list[Finding]:
         n += len(p.text)
     if cur:
         groups.append(cur)
+    return groups
+
+
+def llm_vote(llm: LLM, paras: list[Para], seg_chars: int):
+    """観点別チェックを VOTE_RUNS 回ずつ（サンプリングを変えて）実行し、検出箇所ごとに票を数える。
+    判定規則（事前に固定）: 2回以上検出 → 採用 / 1回だけ → 2次チェック（llm_verify）で採用されたものだけ採用。
+    戻り値: (採用, {区切り番号: 1票の候補}, 区切りの本文)"""
+    from concurrent.futures import ThreadPoolExecutor
+
+    full = "\n".join(p.text for p in paras)
+    groups = segments(paras, seg_chars)
     group_of = {p.idx: gi for gi, g in enumerate(groups) for p in g}
     gtext = ["\n".join(p.text for p in g) for g in groups]
 
-    tasks = []  # (run, system, user, source)
-    for run in range(VOTE_RUNS):
+    # 同じプロンプト（観点 → 区切り → 回）を続けて投げる。LLM サーバーのプロンプトキャッシュが効き、
+    # 2回目以降は本文の読み込み（プロンプト処理）を省ける。各回は独立にサンプリングするので結果の性質は変わらない
+    tasks = []  # (run, title, system, user, source)
+    if WHOLE_VIEWS:
         for name, what in VIEWS_WHOLE:
-            tasks.append((run, f"全文「{name}」", _sys_view(name, what, "明細書全体"), full, "llm-whole"))
+            for run in range(VOTE_RUNS):
+                tasks.append((run, f"全文「{name}」", _sys_view(name, what, "明細書全体"), full, "llm-whole"))
+    for name, what in VIEWS_LOCAL:
+        system = _sys_view(name, what, "渡された本文の一部")
         for gi in range(len(groups)):
-            for name, what in VIEWS_LOCAL:
-                tasks.append((run, f"区切り{gi + 1}「{name}」", _sys_view(name, what, "渡された本文の一部"), "## 本文\n" + gtext[gi], "llm-seg"))
+            for run in range(VOTE_RUNS):
+                tasks.append((run, f"区切り{gi + 1}「{name}」", system, "## 本文\n" + gtext[gi], "llm-seg"))
     done = [0]
 
     def run_task(t):
@@ -480,7 +723,7 @@ def llm_checks(llm: LLM, paras: list[Para], seg_chars: int) -> list[Finding]:
             f.run = run
         return out
 
-    log(f"LLM: 観点別チェックを {VOTE_RUNS} 回ずつ（{len(tasks)} 呼び出し、同時 {PARALLEL}）")
+    log(f"LLM: 観点別チェックを {VOTE_RUNS} 回ずつ（{len(tasks)} 呼び出し、同時 {PARALLEL}）" + ("" if WHOLE_VIEWS else "。全文の観点はルールチェックで代替"))
     cands: list[Finding] = []
     with ThreadPoolExecutor(PARALLEL) as ex:
         for out in ex.map(run_task, tasks):
@@ -516,14 +759,27 @@ def llm_checks(llm: LLM, paras: list[Para], seg_chars: int) -> list[Finding]:
         else:
             single.setdefault(group_of.get(rep.para_idx, 0), []).append(rep)
     log(f"LLM: 候補 {len(clusters)} 箇所（2回以上 {len(adopted)}、1回だけ {sum(len(v) for v in single.values())}）")
+    return adopted, single, gtext
+
+
+def llm_verify(llm: LLM, single: dict[int, list[Finding]], gtext: list[str]) -> list[Finding]:
+    from concurrent.futures import ThreadPoolExecutor
 
     def verify_group(item):
         gi, lst = item
         return _verify(llm, gtext[gi], lst)
 
+    out: list[Finding] = []
     with ThreadPoolExecutor(PARALLEL) as ex:
-        for out in ex.map(verify_group, sorted(single.items())):
-            adopted += out
+        for got in ex.map(verify_group, sorted(single.items())):
+            out += got
+    log(f"LLM: 1票の候補 {sum(len(v) for v in single.values())} 件のうち {len(out)} 件を検証で採用")
+    return out
+
+
+def llm_checks(llm: LLM, paras: list[Para], seg_chars: int) -> list[Finding]:
+    adopted, single, gtext = llm_vote(llm, paras, seg_chars)
+    adopted += llm_verify(llm, single, gtext)
     log(f"LLM: 多数決＋検証の結果 {len(adopted)} 件")
     return adopted
 
@@ -724,6 +980,13 @@ def apply_to_docx(doc, findings: list[Finding]):
                 f.applied = "report-only"
 
 
+def write_table_csv(path, table: dict[str, dict]):
+    with open(path, "w", newline="", encoding="utf-8-sig") as fp:
+        w = csv.writer(fp)
+        w.writerow(["符号", "本文の名称（回数）", "符号の説明", "初出", "図面", "矛盾"])
+        w.writerows(table_rows(table))
+
+
 # ---------------------------------------------------------------------------
 def log(msg: str):
     print(msg, file=sys.stderr, flush=True)
@@ -749,13 +1012,14 @@ def main():
         raise SystemExit("【書類名】明細書 以降の本文が見つかりません。")
     log(f"本文 {len(paras)} 段落 / {sum(len(p.text) for p in paras)} 文字")
 
-    findings = rule_checks(paras)
+    table = symbol_table(paras)
+    findings = rule_checks(paras, table)
     log(f"ルールチェック: {len(findings)} 件")
     if not args.no_llm:
         llm = LLM(args.base_url, args.model, args.api_key, verbose=True)
         t0 = time.time()
         findings += llm_checks(llm, paras, args.segment_chars)
-        log(f"LLM 呼び出し {llm.calls} 回 / {int(time.time() - t0)} 秒")
+        log(f"LLM {llm.summary()} / 合計 {int(time.time() - t0)} 秒")
 
     located = [f for f in findings if locate(f, paras)]
     dropped = len(findings) - len(located)
@@ -767,6 +1031,7 @@ def main():
     out_docx = out_dir / f"【AI校正】{src.name}"
     out_csv = out_dir / f"{src.stem}_修正箇所一覧.csv"
     doc.save(str(out_docx))
+    write_table_csv(out_dir / f"{src.stem}_符号対応表.csv", table)
     with open(out_csv, "w", newline="", encoding="utf-8-sig") as fp:
         w = csv.writer(fp)
         w.writerow(["No", "段落番号", "修正前", "修正後", "種類", "備考", "要確認", "反映", "検出元"])
@@ -774,6 +1039,7 @@ def main():
             w.writerow([i, f.label, f.before, f.after, f.kind, f.note, "○" if f.needs_check else "", f.applied, f.source])
     print(out_docx)
     print(out_csv)
+    print(out_dir / f"{src.stem}_符号対応表.csv")
 
 
 if __name__ == "__main__":

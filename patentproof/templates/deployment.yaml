@@ -31,7 +31,7 @@ spec:
         - -c
         - |
           set -e
-          pip install --no-cache-dir --disable-pip-version-check --target /tmp/pylib python-docx==1.2.0 pypdf
+          pip install --no-cache-dir --disable-pip-version-check --target /tmp/pylib python-docx==1.2.0 pypdf janome==0.5.0
           exec python -u /app/server.py
         env:
         - name: PYTHONPATH
